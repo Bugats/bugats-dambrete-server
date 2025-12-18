@@ -1,7 +1,17 @@
-"dependencies": {
-  "cors": "^2.8.5",
-  "express": "^4.19.0",
-  "socket.io": "^4.7.4",
-  "mongoose": "^6.0.0",
-  "jsonwebtoken": "^8.5.1"
+{
+  "name": "bugats-dambrete-server",
+  "version": "1.0.0",
+  "description": "Bugats Dambretes online serveris (Node + Socket.IO)",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "socket.io": "^4.7.4",
+    "mongoose": "^6.0.0",
+    "jsonwebtoken": "^8.5.1"
+  }
 }
