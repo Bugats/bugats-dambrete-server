@@ -1,25 +1,25 @@
-import express from "express";
-import { createServer } from "http";
-import { Server } from "socket.io";
-import cors from "cors";
+import express from 'express';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
 
 const app = express();
 const PORT = process.env.PORT || 10080;
-const SIZE = 8;
+const SIZE = 8; // 8x8 checkers board size
 
 app.use(cors());
 app.use(express.json());
 
-// Socket.IO konfigurācija
+// Socket.IO setup
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"],
-  },
+    methods: ["GET", "POST"]
+  }
 });
 
-// Spēles dēļa sākotnējais stāvoklis
+// Initialize board for checkers
 function createInitialBoard() {
   const board = [];
   for (let r = 0; r < SIZE; r++) {
@@ -28,9 +28,9 @@ function createInitialBoard() {
       let piece = null;
       const dark = (r + c) % 2 === 1;
       if (dark && r < 3) {
-        piece = { color: "b", king: false }; // melnie kauliņi
+        piece = { color: "b", king: false }; // Black pieces
       } else if (dark && r > 4) {
-        piece = { color: "w", king: false }; // baltie kauliņi
+        piece = { color: "w", king: false }; // White pieces
       }
       row.push(piece);
     }
@@ -39,10 +39,9 @@ function createInitialBoard() {
   return board;
 }
 
-// Istabas stāvoklis
+// Room management
 const rooms = new Map(); // roomId -> room
 
-// Jaunas istabas ģenerēšana
 function generateRoomId() {
   const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let id = "";
@@ -52,136 +51,76 @@ function generateRoomId() {
   return id;
 }
 
-// Istabas izveide
 function createRoom(hostSocket, nickname) {
   const id = generateRoomId();
   const board = createInitialBoard();
   const room = {
     id,
     board,
-    currentPlayer: "b", // melnie sāk
+    currentPlayer: "b", // Black starts
     players: {
-      b: { socketId: hostSocket.id, nickname: nickname || "Spēlētājs" },
-      w: null,
+      b: { socketId: hostSocket.id, nickname: nickname || "Player" },
+      w: null
     },
     gameOver: false,
-    winner: null, // "b" | "w" | null
+    winner: null // "b" | "w" | null
   };
   rooms.set(id, room);
   return room;
 }
 
-// Socket.IO notikumi
 io.on("connection", (socket) => {
-  console.log("Savienots:", socket.id);
-  socket.data.nickname = "Spēlētājs";
+  socket.data.nickname = "Player";
   socket.data.roomId = null;
   socket.data.color = null;
 
-  // Pievienoties istabai
+  // Join lobby
   socket.on("joinLobby", (payload) => {
-    const nick = (payload && payload.nickname) || "Spēlētājs";
-    socket.data.nickname = String(nick).slice(0, 16);
+    const nick = (payload && payload.nickname) || "Player";
+    socket.data.nickname = nick;
     socket.emit("lobbyState", { rooms: Array.from(rooms.values()) });
   });
 
-  // Izveidot istabu
+  // Create room
   socket.on("createRoom", () => {
-    if (!socket.data.nickname) {
-      socket.data.nickname = "Spēlētājs";
-    }
     const room = createRoom(socket, socket.data.nickname);
     socket.join(room.id);
     socket.data.roomId = room.id;
     socket.data.color = "b";
-
-    socket.emit("roomJoined", {
-      room: room,
-      yourColor: "b",
-    });
+    socket.emit("roomJoined", { room, yourColor: "b" });
     io.to(room.id).emit("roomState", room);
   });
 
-  // Pievienoties esošai istabai
+  // Join existing room
   socket.on("joinRoom", (payload) => {
-    const roomId = payload && payload.roomId;
-    if (!roomId || !rooms.has(roomId)) {
-      socket.emit("errorMessage", { message: "Istaba neeksistē." });
-      return;
-    }
-
+    const roomId = payload.roomId;
     const room = rooms.get(roomId);
+    if (!room) return socket.emit("errorMessage", { message: "Room doesn't exist." });
+
     if (room.players.b && room.players.w) {
-      socket.emit("errorMessage", { message: "Istaba ir pilna." });
-      return;
+      return socket.emit("errorMessage", { message: "Room is full." });
     }
 
-    // Piešķirt otro spēlētāju
     let color = null;
     if (!room.players.b) {
       color = "b";
-      room.players.b = { socketId: socket.id, nickname: socket.data.nickname || "Spēlētājs" };
+      room.players.b = { socketId: socket.id, nickname: socket.data.nickname || "Player" };
     } else {
       color = "w";
-      room.players.w = { socketId: socket.id, nickname: socket.data.nickname || "Spēlētājs" };
+      room.players.w = { socketId: socket.id, nickname: socket.data.nickname || "Player" };
     }
 
     socket.join(room.id);
     socket.data.roomId = room.id;
     socket.data.color = color;
-
-    socket.emit("roomJoined", {
-      room: room,
-      yourColor: color,
-    });
+    socket.emit("roomJoined", { room, yourColor: color });
     io.to(room.id).emit("roomState", room);
   });
 
-  // Atstāt istabu
+  // Leave room
   socket.on("leaveRoom", () => {
-    leaveCurrentRoom(socket);
-    socket.emit("leftRoom");
-  });
-
-  // Gājiens
-  socket.on("makeMove", (payload) => {
     const roomId = socket.data.roomId;
-    const color = socket.data.color;
-    if (!roomId || !color || !rooms.has(roomId)) {
-      socket.emit("invalidMove", { reason: "notInRoom" });
-      return;
-    }
-
-    const room = rooms.get(roomId);
-    const { from, to } = payload || {};
-    if (!from || !to) {
-      socket.emit("invalidMove", { reason: "badPayload" });
-      return;
-    }
-
-    // Pārbauda un piemēro gājienu
-    const result = tryMakeMove(room, color, from.row, from.col, to.row, to.col);
-
-    if (!result.ok) {
-      socket.emit("invalidMove", { reason: result.reason });
-      return;
-    }
-
-    io.to(room.id).emit("roomState", room);
-  });
-
-  socket.on("disconnect", () => {
-    console.log("Atvienots:", socket.id);
-    leaveCurrentRoom(socket);
-  });
-
-  function leaveCurrentRoom(socket) {
-    const roomId = socket.data.roomId;
-    if (!roomId || !rooms.has(roomId)) {
-      socket.data.roomId = null;
-      socket.data.color = null;
-      return;
-    }
+    if (!roomId || !rooms.has(roomId)) return;
 
     const room = rooms.get(roomId);
     if (room.players.b && room.players.b.socketId === socket.id) {
@@ -196,13 +135,44 @@ io.on("connection", (socket) => {
 
     if (!room.players.b && !room.players.w) {
       rooms.delete(roomId);
-    } else {
-      io.to(room.id).emit("roomState", room);
     }
-  }
+    io.to(room.id).emit("roomState", room);
+  });
+
+  // Make move
+  socket.on("makeMove", (payload) => {
+    const roomId = socket.data.roomId;
+    const color = socket.data.color;
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const { from, to } = payload || {};
+    if (!from || !to) return socket.emit("invalidMove", { reason: "badPayload" });
+
+    const result = tryMakeMove(room, color, from.row, from.col, to.row, to.col);
+    if (!result.ok) return socket.emit("invalidMove", { reason: result.reason });
+
+    io.to(room.id).emit("roomState", room);
+  });
+
+  // Handle disconnection
+  socket.on("disconnect", () => {
+    const roomId = socket.data.roomId;
+    if (!roomId || !rooms.has(roomId)) return;
+
+    const room = rooms.get(roomId);
+    if (room.players.b && room.players.b.socketId === socket.id) {
+      room.players.b = null;
+    } else if (room.players.w && room.players.w.socketId === socket.id) {
+      room.players.w = null;
+    }
+
+    if (!room.players.b && !room.players.w) {
+      rooms.delete(roomId);
+    }
+    io.to(room.id).emit("roomState", room);
+  });
 });
 
-// Serveris klausās uz portu
-httpServer.listen(PORT, () => {
-  console.log("Serveris darbojas uz porta", PORT);
-});
+// Start server
+httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
