@@ -1,50 +1,45 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
+const path = require('path');
+
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
-const PORT = process.env.PORT || 3000;
-
-// Serve public files
-app.use(express.static('public'));
-
-// Veidošanas reģistrācija (spēlētāju attēli un uzvaras)
+// Saglabā spēlētāju datus
 let players = {};
 
+// Izveido servera sakaru ar klientu
 io.on('connection', (socket) => {
-    console.log('Player connected');
-    
-    // Izsauc spēlētāju, kad viņš pievienojas
+    console.log(`Player connected: ${socket.id}`);
+
+    // Pieprasījums pievienot spēlētāju
     socket.on('joinGame', (playerData) => {
-        players[socket.id] = playerData;
-        io.emit('playerList', players); // Nosūta visiem spēlētājiem reāllaika spēlētāju sarakstu
+        players[socket.id] = playerData; // Saglabā spēlētāja informāciju
+        io.emit('playerList', players);  // Nosūta spēlētāju sarakstu visiem spēlētājiem
+        console.log(`${playerData.name} joined the game!`);
     });
 
-    // Nosūta spēlētāju informāciju katram klientam
-    socket.emit('playerInfo', players[socket.id]);
-
-    // Spēlētāja kustība
-    socket.on('move', (data) => {
-        console.log('Move received:', data);
-        io.emit('move', data);  // Nosūta visiem spēlētājiem spēles kustības
-    });
-
-    // Izmanto spēles beigu stāvokli
-    socket.on('gameOver', (result) => {
-        io.emit('gameOver', result);  // Nosūta visiem spēlētājiem
+    // Spēlētāja attēla nosūtīšana
+    socket.on('updateImage', (image) => {
+        if (players[socket.id]) {
+            players[socket.id].image = image; // Atjaunina attēlu
+        }
     });
 
     // Atvieno spēlētāju
     socket.on('disconnect', () => {
-        console.log('Player disconnected');
-        delete players[socket.id];
-        io.emit('playerList', players);  // Atjaunina spēlētāju sarakstu
+        console.log(`Player disconnected: ${socket.id}`);
+        delete players[socket.id]; // Noņem spēlētāju no saraksta
+        io.emit('playerList', players); // Nosūta atjaunoto sarakstu
     });
 });
 
-// Startējot serveri
-server.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+// Serve HTML failu
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Servera uzsākšana
+server.listen(3000, () => {
+    console.log('Server is running on http://localhost:3000');
 });
