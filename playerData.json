@@ -1,0 +1,12 @@
+[
+  {
+    "nickname": "Player1",
+    "score": 50,
+    "profilePic": "https://example.com/player1.jpg"
+  },
+  {
+    "nickname": "Player2",
+    "score": 60,
+    "profilePic": "https://example.com/player2.jpg"
+  }
+]
