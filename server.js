@@ -7,8 +7,9 @@ import cloudinary from "cloudinary";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import path from "path";
+import fs from "fs";
 
-// MongoDB User Model
+// MongoDB lietotāja modelis
 const User = mongoose.model("User", {
   nickname: String,
   profilePic: String,
@@ -23,7 +24,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static("public")); // Serve profile images
 
-// Cloudinary configuration
+// Cloudinary konfigurācija
 cloudinary.config({
   cloud_name: 'your-cloud-name',
   api_key: 'your-api-key',
@@ -40,6 +41,14 @@ const storage = multer.diskStorage({
   },
 });
 const upload = multer({ storage });
+
+// PlayerData.json importēšana
+function getPlayerData() {
+  const filePath = path.join(__dirname, 'playerData.json');
+  const rawData = fs.readFileSync(filePath);
+  const playerData = JSON.parse(rawData);
+  return playerData;
+}
 
 // User registration route
 app.post("/register", async (req, res) => {
