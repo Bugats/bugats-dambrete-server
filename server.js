@@ -1,52 +1,20 @@
-body {
-  font-family: Arial, sans-serif;
-  background-color: #181818;
-  color: white;
-  text-align: center;
-}
+import express from "express";
+import path from "path";
+import { createServer } from "http";
+import { Server } from "socket.io";
 
-#game {
-  margin-top: 50px;
-}
+const app = express();
+const server = createServer(app);
+const io = new Server(server);
 
-#gameBoard {
-  display: grid;
-  grid-template-columns: repeat(8, 1fr);
-  grid-template-rows: repeat(8, 1fr);
-  gap: 2px;
-  width: 400px;
-  margin: 0 auto;
-}
+app.use(express.static(path.join(__dirname, "public"))); // Pārliecinies, ka public mape satur HTML un CSS failus
 
-.row {
-  display: flex;
-}
+// Socket.IO loģika
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+  // Tev būs jāievieto sava spēles loģika šeit...
+});
 
-.cell {
-  width: 50px;
-  height: 50px;
-  background-color: #deb887;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-}
-
-.cell.black {
-  background-color: #000;
-}
-
-#onlineCount, #topPlayers {
-  color: white;
-}
-
-button {
-  background-color: #007bff;
-  color: white;
-  border: none;
-  padding: 10px;
-  cursor: pointer;
-}
-
-button:hover {
-  background-color: #0056b3;
-}
+server.listen(3000, () => {
+  console.log("Server is running on http://localhost:3000");
+});
