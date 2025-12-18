@@ -1,4 +1,3 @@
-
 const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
@@ -17,6 +16,11 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "https://thezone.lv,http
   .map(s => s.trim())
   .filter(Boolean);
 
+// ===== BOT konfigurācija =====
+const BOT_JOIN_WAIT_MS = parseInt(process.env.BOT_JOIN_WAIT_MS || "10000", 10); // 10s
+const BOT_THINK_MIN_MS = parseInt(process.env.BOT_THINK_MIN_MS || "450", 10);
+const BOT_THINK_MAX_MS = parseInt(process.env.BOT_THINK_MAX_MS || "900", 10);
+
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
@@ -32,7 +36,7 @@ ensureDir(UPLOADS_DIR);
 ensureDir(AVATARS_DIR);
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "{}", "utf8");
 
-// ---- atomic JSON write queue (lai nesalauž fails paralēli rakstot) ----
+// ---- atomic JSON write queue ----
 let writeQueue = Promise.resolve();
 function atomicWriteJSON(file, obj) {
   writeQueue = writeQueue.then(async () => {
@@ -288,14 +292,12 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
 
       if (board[lr][lc] !== null) continue;
 
-      // simulate
       const nb = cloneBoard(board);
       nb[r][c] = null;
       nb[mr][mc] = null;
 
       let np = piece;
       np = promoteIfNeeded(np, lr, color);
-
       nb[lr][lc] = np;
 
       const nCaptured = new Set(capturedSet);
@@ -321,12 +323,10 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
 
       if (cell === null) {
         if (foundOpp) {
-          // landing after capturing foundOpp
           const [or, oc] = foundOpp;
           const oppKey = `${or},${oc}`;
           if (capturedSet.has(oppKey)) { rr += dr; cc += dc; continue; }
 
-          // simulate landing
           const nb = cloneBoard(board);
           nb[r][c] = null;
           nb[or][oc] = null;
@@ -346,10 +346,8 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
         continue;
       }
 
-      // piece encountered
-      if (colorOf(cell) === color) break; // blocked by own
+      if (colorOf(cell) === color) break;
       if (colorOf(cell) === opp) {
-        // if already found opponent, cannot jump over two in one segment
         if (foundOpp) break;
         foundOpp = [rr, cc];
         rr += dr; cc += dc;
@@ -364,7 +362,7 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
 }
 
 function allCapturePlans(board, color) {
-  const plans = new Map(); // key "r,c" -> array of sequences (each seq is [ [r1,c1], [r2,c2], ... ] landings)
+  const plans = new Map();
   let maxCap = 0;
 
   for (let r = 0; r < 8; r++) {
@@ -374,7 +372,6 @@ function allCapturePlans(board, color) {
       if (colorOf(p) !== color) continue;
       const seqs = genCapturesFrom(board, r, c, p, new Set());
       if (seqs.length > 0) {
-        // captures count = seq length
         for (const s of seqs) maxCap = Math.max(maxCap, s.length);
         plans.set(`${r},${c}`, seqs);
       }
@@ -383,7 +380,6 @@ function allCapturePlans(board, color) {
 
   if (maxCap === 0) return { mustCapture: false, maxCap: 0, plans: new Map() };
 
-  // filter only max capture sequences (Russian rule: must capture maximum)
   const filtered = new Map();
   for (const [from, seqs] of plans.entries()) {
     const keep = seqs.filter(s => s.length === maxCap);
@@ -393,8 +389,7 @@ function allCapturePlans(board, color) {
 }
 
 function allQuietMoves(board, color) {
-  // only when no captures exist
-  const moves = new Map(); // "r,c" -> array of to squares [[r,c],...]
+  const moves = new Map();
   for (let r = 0; r < 8; r++) {
     for (let c = 0; c < 8; c++) {
       const p = board[r][c];
@@ -429,7 +424,6 @@ function allQuietMoves(board, color) {
 }
 
 function findCapturedSquare(board, fr, fc, tr, tc) {
-  // assumes diagonal move
   const dr = Math.sign(tr - fr);
   const dc = Math.sign(tc - fc);
   let r = fr + dr, c = fc + dc;
@@ -438,12 +432,12 @@ function findCapturedSquare(board, fr, fc, tr, tc) {
   while (r !== tr && c !== tc) {
     const p = board[r][c];
     if (p !== null) {
-      if (found) return null; // more than one piece in between
+      if (found) return null;
       found = [r, c];
     }
     r += dr; c += dc;
   }
-  return found; // may be null for quiet move
+  return found;
 }
 
 function hasAnyMove(board, color) {
@@ -466,8 +460,8 @@ function makeRoomId() {
 function publicRoomInfo(room) {
   return {
     id: room.id,
-    white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl } : null,
-    black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl } : null,
+    white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl || "" } : null,
+    black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl || "" } : null,
     spectators: room.spectators.size,
     status: room.status
   };
@@ -479,17 +473,69 @@ async function getUserPublic(username) {
   return u ? safeUserPublic(u) : null;
 }
 
+// ===== BOT helpers =====
+function rnd(min, max) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+function makeBotSeat(roomId, color) {
+  return { username: `BOT_${roomId}_${color.toUpperCase()}`, avatarUrl: "", isBot: true };
+}
+function seatIsBot(seat) {
+  return !!seat?.isBot || (typeof seat?.username === "string" && seat.username.startsWith("BOT_"));
+}
+function botColor(room) {
+  if (seatIsBot(room.white)) return "w";
+  if (seatIsBot(room.black)) return "b";
+  return null;
+}
+function botUsername(room) {
+  if (seatIsBot(room.white)) return room.white.username;
+  if (seatIsBot(room.black)) return room.black.username;
+  return null;
+}
+function otherHumanUsername(room, color) {
+  if (color === "w") return room.black?.username || null;
+  return room.white?.username || null;
+}
+
+function roomStatePayload(room) {
+  return {
+    id: room.id,
+    board: room.board,
+    turn: room.turn,
+    status: room.status,
+    lastMove: room.lastMove || null,
+    white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl || "" } : null,
+    black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl || "" } : null,
+    winner: room.winner || null,
+    reason: room.reason || null
+  };
+}
+
+function emitRoomList() {
+  const list = Array.from(rooms.values()).map(publicRoomInfo);
+  io.to("lobby").emit("room:list", list);
+}
+
+function emitOnlineCount() {
+  io.emit("online:count", io.engine.clientsCount);
+}
+
+function findSocketIdByUsername(username) {
+  if (!username) return null;
+  for (const [id, s] of io.of("/").sockets) {
+    if (s.username === username) return id;
+  }
+  return null;
+}
+
+// ===== Turn move packaging =====
 function buildYourMoves(room, color) {
-  // if pending chain -> only that piece can move and only next steps allowed
+  // pending chain: only that piece can move
   if (room.pending && room.pending.color === color) {
     const key = `${room.pending.cur[0]},${room.pending.cur[1]}`;
-    const nextIndex = room.pending.stepIndex + 1; // landings index in sequence
     const nextTo = new Set();
-
     for (const seq of room.pending.remainingSeqs) {
-      const step = seq[nextIndex - 1]; // seq contains landings only; stepIndex counts landings done
-      // careful: pending.stepIndex = number of landings already done
-      // next landing is seq[pending.stepIndex]
       const nxt = seq[room.pending.stepIndex];
       if (nxt) nextTo.add(`${nxt[0]},${nxt[1]}`);
     }
@@ -502,7 +548,6 @@ function buildYourMoves(room, color) {
     };
   }
 
-  // not pending -> compute captures; if none, compute quiet moves
   const cap = allCapturePlans(room.board, color);
   if (cap.mustCapture) {
     const selectable = [];
@@ -510,8 +555,6 @@ function buildYourMoves(room, color) {
     for (const [from, seqs] of cap.plans.entries()) {
       const [fr, fc] = from.split(",").map(n => parseInt(n, 10));
       selectable.push([fr, fc]);
-
-      // allowed first steps: unique of seq[0]
       const set = new Set();
       for (const seq of seqs) set.add(`${seq[0][0]},${seq[0][1]}`);
       moves[from] = Array.from(set).map(s => s.split(",").map(n => parseInt(n, 10)));
@@ -532,22 +575,16 @@ function buildYourMoves(room, color) {
   return { pending: false, mustCapture: false, selectable, moves };
 }
 
-function emitRoomList() {
-  const list = Array.from(rooms.values()).map(publicRoomInfo);
-  io.to("lobby").emit("room:list", list);
-}
-
-function emitOnlineCount() {
-  io.emit("online:count", io.engine.clientsCount);
-}
-
 async function updateStatsOnResult(winnerUsername, loserUsername) {
+  // BOT spēles leaderboardā NEskaitām (pret farmu)
+  if (!winnerUsername || !loserUsername) return;
+  if (winnerUsername.startsWith("BOT_") || loserUsername.startsWith("BOT_")) return;
+
   const users = await readUsers();
   const wKey = winnerUsername.toLowerCase();
   const lKey = loserUsername.toLowerCase();
   if (!users[wKey] || !users[lKey]) return;
 
-  // basic competitive numbers
   users[wKey].stats.wins += 1;
   users[wKey].stats.xp += 25;
   users[wKey].stats.rating += 10;
@@ -557,22 +594,276 @@ async function updateStatsOnResult(winnerUsername, loserUsername) {
   users[lKey].stats.rating = Math.max(800, (users[lKey].stats.rating || 1000) - 8);
 
   await atomicWriteJSON(USERS_FILE, users);
-
   io.emit("leaderboard:top10", computeTop10(users));
 }
 
-function roomStatePayload(room) {
-  return {
-    id: room.id,
-    board: room.board,
-    turn: room.turn,
-    status: room.status,
-    lastMove: room.lastMove || null,
-    white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl } : null,
-    black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl } : null,
-    winner: room.winner || null,
-    reason: room.reason || null
-  };
+function scheduleBotIfWaiting(room) {
+  // tikai ja 1 cilvēks un 1 tukša vieta
+  if (!room || room.status !== "waiting") return;
+  if (room.botTimer) return;
+
+  const wHuman = room.white && !seatIsBot(room.white);
+  const bHuman = room.black && !seatIsBot(room.black);
+
+  const hasExactlyOneHuman =
+    (wHuman && !room.black) ||
+    (bHuman && !room.white);
+
+  if (!hasExactlyOneHuman) return;
+
+  room.botTimer = setTimeout(() => {
+    room.botTimer = null;
+
+    // pārbaude, vai room vēl eksistē un vēl gaida
+    const current = rooms.get(room.id);
+    if (!current || current.status !== "waiting") return;
+
+    const wH = current.white && !seatIsBot(current.white);
+    const bH = current.black && !seatIsBot(current.black);
+
+    // ja pa to laiku ienāca cilvēks -> neko nedaram
+    if (current.white && current.black) return;
+
+    // ieliekam BOT tukšajā vietā
+    if (wH && !current.black) current.black = makeBotSeat(current.id, "b");
+    else if (bH && !current.white) current.white = makeBotSeat(current.id, "w");
+    else return;
+
+    // startējam spēli
+    current.status = "playing";
+    current.winner = null;
+    current.reason = null;
+    current.pending = null;
+    current.turnPlan = null;
+    current.turn = "w";
+    current.lastMove = null;
+
+    io.to(current.id).emit("game:state", roomStatePayload(current));
+    emitRoomList();
+
+    sendTurnMoves(current); // arī palaidīs botu, ja viņam gājiens
+  }, BOT_JOIN_WAIT_MS);
+}
+
+function clearBotTimers(room) {
+  if (!room) return;
+  if (room.botTimer) {
+    clearTimeout(room.botTimer);
+    room.botTimer = null;
+  }
+  if (room.botThinkTimer) {
+    clearTimeout(room.botThinkTimer);
+    room.botThinkTimer = null;
+  }
+}
+
+function finishGame(room, winnerUsername, reason) {
+  room.status = "finished";
+  room.winner = winnerUsername || null;
+  room.reason = reason || "END";
+  room.pending = null;
+  room.turnPlan = null;
+
+  io.to(room.id).emit("game:state", roomStatePayload(room));
+  emitRoomList();
+}
+
+function sendTurnMoves(room) {
+  if (!room || room.status !== "playing") return;
+
+  const turnColor = room.turn;
+  const currentUsername = (turnColor === "w") ? room.white?.username : room.black?.username;
+  const currentSeat = (turnColor === "w") ? room.white : room.black;
+
+  // ja BOT gājiens -> palaid bot
+  if (seatIsBot(currentSeat)) {
+    // cilvēkam noņemam highlight
+    const otherUser = otherHumanUsername(room, turnColor);
+    const otherSock = findSocketIdByUsername(otherUser);
+    if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
+
+    scheduleBotMove(room);
+    return;
+  }
+
+  // cilvēka gājiens -> sūta legal moves
+  const sId = findSocketIdByUsername(currentUsername);
+  if (sId) {
+    const legal = buildYourMoves(room, turnColor);
+    io.to(sId).emit("game:yourMoves", legal);
+  }
+
+  // otram spēlētājam (ja ir cilvēks) notīra
+  const otherUser = otherHumanUsername(room, turnColor);
+  const otherSock = findSocketIdByUsername(otherUser);
+  if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
+}
+
+function pickBotMove(legal) {
+  if (!legal || !legal.moves || !legal.selectable || legal.selectable.length === 0) return null;
+
+  // izvēlamies random no "selectable" kauliņiem
+  const from = legal.selectable[rnd(0, legal.selectable.length - 1)];
+  const key = `${from[0]},${from[1]}`;
+  const tos = legal.moves[key] || [];
+  if (!tos.length) return null;
+
+  const to = tos[rnd(0, tos.length - 1)];
+  return { from, to };
+}
+
+function applyMoveCore(room, myColor, from, to, byUsername) {
+  const [fr, fc] = from;
+  const [tr, tc] = to;
+
+  // basic checks
+  if (!inBounds(fr, fc) || !inBounds(tr, tc)) return { ok: false };
+  if (!isDark(fr, fc) || !isDark(tr, tc)) return { ok: false };
+  if (room.board[tr][tc] !== null) return { ok: false };
+
+  const piece = room.board[fr][fc];
+  if (!piece || colorOf(piece) !== myColor) return { ok: false };
+
+  // server-authoritative legal check
+  const legal = buildYourMoves(room, myColor);
+  const key = `${fr},${fc}`;
+  const allowedTos = legal?.moves?.[key] || null;
+  if (!allowedTos) return { ok: false };
+  const okTo = allowedTos.some(([r, c]) => r === tr && c === tc);
+  if (!okTo) return { ok: false };
+
+  // diagonal only
+  const dr = tr - fr;
+  const dc = tc - fc;
+  if (Math.abs(dr) !== Math.abs(dc)) return { ok: false };
+
+  // capture detection
+  let didCapture = false;
+  let captured = null;
+  captured = findCapturedSquare(room.board, fr, fc, tr, tc);
+  if (captured) {
+    const [cr, cc] = captured;
+    const capPiece = room.board[cr][cc];
+    if (!capPiece) return { ok: false };
+    if (colorOf(capPiece) !== opponent(myColor)) return { ok: false };
+    didCapture = true;
+  }
+
+  // apply
+  room.board[fr][fc] = null;
+  if (didCapture) {
+    const [cr, cc] = captured;
+    room.board[cr][cc] = null;
+  }
+
+  let newPiece = promoteIfNeeded(piece, tr, myColor);
+  room.board[tr][tc] = newPiece;
+
+  room.lastMove = { by: byUsername, from: [fr, fc], to: [tr, tc], capture: didCapture };
+
+  // manage pending max-capture chain
+  if (didCapture) {
+    if (!room.pending) {
+      const plan = room.turnPlan;
+      const seqs = plan?.capPlans?.get(`${fr},${fc}`) || [];
+      const matching = seqs.filter(s => s[0][0] === tr && s[0][1] === tc);
+      room.pending = {
+        color: myColor,
+        start: [fr, fc],
+        cur: [tr, tc],
+        stepIndex: 1,
+        remainingSeqs: matching
+      };
+    } else {
+      const rem = room.pending.remainingSeqs;
+      const idx = room.pending.stepIndex;
+      const matching = rem.filter(s => s[idx] && s[idx][0] === tr && s[idx][1] === tc);
+      room.pending.cur = [tr, tc];
+      room.pending.stepIndex += 1;
+      room.pending.remainingSeqs = matching;
+    }
+
+    const stillHasNext = room.pending.remainingSeqs.some(s => s[room.pending.stepIndex] != null);
+    if (stillHasNext) {
+      // tas pats spēlētājs turpina
+      return { ok: true, continued: true };
+    }
+
+    // ķēde pabeigta
+    room.pending = null;
+  }
+
+  // turn switch
+  room.turn = opponent(room.turn);
+  room.turnPlan = null;
+
+  // win check: new turn player has moves?
+  const oppColor = room.turn;
+  const oppHas = hasAnyMove(room.board, oppColor);
+  if (!oppHas) {
+    const winner = (myColor === "w") ? room.white?.username : room.black?.username;
+    return { ok: true, finished: true, winner, reason: "NO_MOVES" };
+  }
+
+  return { ok: true, continued: false, finished: false };
+}
+
+function scheduleBotMove(room) {
+  if (!room || room.status !== "playing") return;
+
+  // tikai ja tagad BOT gājiens
+  const bc = botColor(room);
+  if (!bc) return;
+  if (room.turn !== bc) return;
+
+  if (room.botThinkTimer) return; // jau ieplānots
+
+  room.botThinkTimer = setTimeout(async () => {
+    room.botThinkTimer = null;
+
+    const current = rooms.get(room.id);
+    if (!current || current.status !== "playing") return;
+
+    const botC = botColor(current);
+    if (!botC || current.turn !== botC) return;
+
+    const legal = buildYourMoves(current, botC);
+    const pick = pickBotMove(legal);
+    if (!pick) {
+      // botam nav gājienu -> cilvēks uzvar
+      const human = otherHumanUsername(current, botC);
+      finishGame(current, human, "BOT_NO_MOVES");
+      return;
+    }
+
+    const res = applyMoveCore(current, botC, pick.from, pick.to, botUsername(current) || "BOT");
+    io.to(current.id).emit("game:state", roomStatePayload(current));
+
+    if (!res.ok) {
+      // ja botam kaut kas nesakrīt (nevajadzētu), mēģinam vēlreiz
+      scheduleBotMove(current);
+      return;
+    }
+
+    if (res.finished) {
+      finishGame(current, res.winner, res.reason);
+      // stat updates (bot spēles skipotas)
+      if (res.winner) {
+        const loser = otherHumanUsername(current, botC);
+        await updateStatsOnResult(res.winner, loser);
+      }
+      return;
+    }
+
+    if (res.continued) {
+      // multi-capture turpinās botam
+      scheduleBotMove(current);
+      return;
+    }
+
+    // cilvēka kārta
+    sendTurnMoves(current);
+  }, rnd(BOT_THINK_MIN_MS, BOT_THINK_MAX_MS));
 }
 
 // ---- Socket events ----
@@ -582,7 +873,6 @@ io.on("connection", async (socket) => {
   socket.join("lobby");
   emitOnlineCount();
 
-  // initial lobby data
   const users = await readUsers();
   socket.emit("leaderboard:top10", computeTop10(users));
   emitRoomList();
@@ -594,7 +884,8 @@ io.on("connection", async (socket) => {
     emitOnlineCount();
   });
 
-  socket.on("room:create", async () => {
+  // room:create (optional vsBot flag)
+  socket.on("room:create", async ({ vsBot } = {}) => {
     const id = makeRoomId();
     const u = await getUserPublic(me);
     if (!u) return;
@@ -603,7 +894,7 @@ io.on("connection", async (socket) => {
       id,
       board: initialBoard(),
       turn: "w",
-      status: "waiting", // waiting|playing|finished
+      status: "waiting",
       white: null,
       black: null,
       spectators: new Set(),
@@ -611,15 +902,26 @@ io.on("connection", async (socket) => {
       turnPlan: null,
       winner: null,
       reason: null,
-      lastMove: null
+      lastMove: null,
+      botTimer: null,
+      botThinkTimer: null
     };
 
-    // creator becomes white by default if free
     room.white = { username: u.username, avatarUrl: u.avatarUrl };
     rooms.set(id, room);
 
     emitRoomList();
     socket.emit("room:created", { id });
+
+    if (vsBot) {
+      // uzreiz pieslēdz botu
+      room.black = makeBotSeat(room.id, "b");
+      room.status = "playing";
+      io.to(room.id).emit("game:state", roomStatePayload(room));
+      emitRoomList();
+    } else {
+      scheduleBotIfWaiting(room);
+    }
   });
 
   socket.on("room:join", async ({ id }) => {
@@ -628,12 +930,15 @@ io.on("connection", async (socket) => {
     const u = await getUserPublic(me);
     if (!room || !u) return socket.emit("room:error", { error: "ROOM_NOT_FOUND" });
 
-    // leave lobby join room
     socket.leave("lobby");
     socket.join(id);
 
-    // assign seat
+    // ja bija bot timer, atceļam (cilvēks ienāk)
+    if (room.botTimer) { clearTimeout(room.botTimer); room.botTimer = null; }
+
     let role = "spectator";
+
+    // ja vieta brīva -> ieliek
     if (!room.white || room.white.username === u.username) {
       room.white = { username: u.username, avatarUrl: u.avatarUrl };
       role = "white";
@@ -650,23 +955,25 @@ io.on("connection", async (socket) => {
       room.winner = null;
       room.reason = null;
       room.pending = null;
-      room.turn = "w";
       room.turnPlan = null;
+      room.turn = "w";
+      room.lastMove = null;
+      clearBotTimers(room);
+    } else {
+      room.status = "waiting";
+      room.pending = null;
+      room.turnPlan = null;
+      scheduleBotIfWaiting(room);
     }
 
     io.to(id).emit("game:state", roomStatePayload(room));
     emitRoomList();
 
-    // send legal moves to that socket if it's their turn
-    const myColor = (role === "white") ? "w" : (role === "black") ? "b" : null;
-    if (room.status === "playing" && myColor && room.turn === myColor) {
-      const legal = buildYourMoves(room, myColor);
-      socket.emit("game:yourMoves", legal);
-    } else {
-      socket.emit("game:yourMoves", null);
-    }
-
     socket.emit("room:joined", { id, role });
+
+    // sūta gājienus, ja spēle spēlējas
+    if (room.status === "playing") sendTurnMoves(room);
+    else socket.emit("game:yourMoves", null);
   });
 
   socket.on("game:move", async ({ id, from, to }) => {
@@ -681,147 +988,34 @@ io.on("connection", async (socket) => {
       room.white?.username === u.username ? "w" :
       room.black?.username === u.username ? "b" : null;
 
-    if (!myColor) return; // spectator can't move
+    if (!myColor) return;
     if (room.turn !== myColor) return;
 
     const [fr, fc] = from || [];
     const [tr, tc] = to || [];
     if (![fr, fc, tr, tc].every(n => Number.isInteger(n))) return;
-    if (!inBounds(fr, fc) || !inBounds(tr, tc)) return;
-    if (!isDark(tr, tc) || !isDark(fr, fc)) return;
 
-    const piece = room.board[fr][fc];
-    if (!piece || colorOf(piece) !== myColor) return;
-    if (room.board[tr][tc] !== null) return;
-
-    const legal = buildYourMoves(room, myColor);
-    if (!legal) return;
-
-    const key = `${fr},${fc}`;
-    const allowedTos = (legal.moves && legal.moves[key]) ? legal.moves[key] : null;
-    if (!allowedTos) return;
-
-    const okTo = allowedTos.some(([r, c]) => r === tr && c === tc);
-    if (!okTo) return;
-
-    // determine capture or quiet
-    let didCapture = false;
-    let captured = null;
-
-    const dr = tr - fr;
-    const dc = tc - fc;
-    if (Math.abs(dr) === Math.abs(dc)) {
-      captured = findCapturedSquare(room.board, fr, fc, tr, tc);
-    } else {
-      return; // must be diagonal always
-    }
-
-    if (captured) {
-      const [cr, cc] = captured;
-      const capPiece = room.board[cr][cc];
-      if (!capPiece) return;
-      if (colorOf(capPiece) !== opponent(myColor)) return;
-      didCapture = true;
-    }
-
-    // apply move
-    room.board[fr][fc] = null;
-    if (didCapture) {
-      const [cr, cc] = captured;
-      room.board[cr][cc] = null;
-    }
-
-    let newPiece = piece;
-    newPiece = promoteIfNeeded(newPiece, tr, myColor);
-    room.board[tr][tc] = newPiece;
-
-    room.lastMove = { by: u.username, from: [fr, fc], to: [tr, tc], capture: didCapture };
+    const res = applyMoveCore(room, myColor, [fr, fc], [tr, tc], u.username);
     io.to(id).emit("game:state", roomStatePayload(room));
 
-    // handle pending capture chain based on max-capture sequences
-    if (didCapture) {
-      // if no pending yet -> lock to matching sequences
-      if (!room.pending) {
-        const plan = room.turnPlan;
-        if (!plan || plan.color !== myColor || !plan.capPlans) return;
+    if (!res.ok) return;
 
-        const seqs = plan.capPlans.get(`${fr},${fc}`) || [];
-        // sequences are landings only; must match first landing
-        const matching = seqs.filter(s => s[0][0] === tr && s[0][1] === tc);
-        room.pending = {
-          color: myColor,
-          start: [fr, fc],
-          cur: [tr, tc],
-          stepIndex: 1, // landings done
-          remainingSeqs: matching
-        };
-      } else {
-        // continue
-        const rem = room.pending.remainingSeqs;
-        const idx = room.pending.stepIndex; // next landing index is idx (0-based)
-        const matching = rem.filter(s => s[idx] && s[idx][0] === tr && s[idx][1] === tc);
-        room.pending.cur = [tr, tc];
-        room.pending.stepIndex += 1;
-        room.pending.remainingSeqs = matching;
-      }
-
-      // check if chain must continue (if any remaining sequences still have next step)
-      const stillHasNext = room.pending.remainingSeqs.some(s => s[room.pending.stepIndex] != null);
-
-      if (stillHasNext) {
-        // same player's turn continues
-        const yours = buildYourMoves(room, myColor);
-        // send to current mover
-        const moverSocketId = socket.id;
-        io.to(moverSocketId).emit("game:yourMoves", yours);
-        // opponent gets nothing
-        const oppSock = (myColor === "w")
-          ? findSocketIdByUsername(room.black?.username)
-          : findSocketIdByUsername(room.white?.username);
-        if (oppSock) io.to(oppSock).emit("game:yourMoves", null);
-        return;
-      }
-
-      // chain complete -> clear pending
-      room.pending = null;
-    }
-
-    // end of turn
-    room.turn = opponent(room.turn);
-    room.turnPlan = null;
-
-    // check win condition: opponent no pieces or no moves
-    const oppColor = room.turn;
-    const oppHas = hasAnyMove(room.board, oppColor);
-
-    if (!oppHas) {
-      room.status = "finished";
-      room.winner = (myColor === "w") ? room.white?.username : room.black?.username;
-      room.reason = "NO_MOVES";
-
-      io.to(id).emit("game:state", roomStatePayload(room));
-
+    if (res.finished) {
+      finishGame(room, res.winner, res.reason);
       const loser = (myColor === "w") ? room.black?.username : room.white?.username;
-      if (room.winner && loser) await updateStatsOnResult(room.winner, loser);
-
-      emitRoomList();
+      if (res.winner && loser) await updateStatsOnResult(res.winner, loser);
       return;
     }
 
-    // send legal moves to new turn player
-    const nextPlayerUsername = (room.turn === "w") ? room.white?.username : room.black?.username;
-    const nextSock = findSocketIdByUsername(nextPlayerUsername);
-    if (nextSock) {
-      const legalNext = buildYourMoves(room, room.turn);
-      io.to(nextSock).emit("game:yourMoves", legalNext);
+    if (res.continued) {
+      // cilvēkam jāturpina multi-capture
+      const sId = findSocketIdByUsername(u.username);
+      if (sId) io.to(sId).emit("game:yourMoves", buildYourMoves(room, myColor));
+      return;
     }
 
-    // clear for other
-    const otherUsername = (room.turn === "w") ? room.black?.username : room.white?.username;
-    const otherSock = findSocketIdByUsername(otherUsername);
-    if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
-
-    io.to(id).emit("game:state", roomStatePayload(room));
+    // nākamā kārta (bot vai cilvēks)
+    sendTurnMoves(room);
   });
 
   socket.on("game:resign", async ({ id }) => {
@@ -838,55 +1032,57 @@ io.on("connection", async (socket) => {
 
     if (!myColor) return;
 
-    room.status = "finished";
-    room.winner = (myColor === "w") ? room.black?.username : room.white?.username;
-    room.reason = "RESIGN";
-
-    io.to(id).emit("game:state", roomStatePayload(room));
+    const winner = (myColor === "w") ? room.black?.username : room.white?.username;
+    finishGame(room, winner, "RESIGN");
 
     const loser = u.username;
-    if (room.winner && loser) await updateStatsOnResult(room.winner, loser);
-
-    emitRoomList();
+    if (winner && loser) await updateStatsOnResult(winner, loser);
   });
 
   socket.on("disconnect", () => {
     emitOnlineCount();
 
-    // remove from rooms seats if present
     for (const room of rooms.values()) {
+      const wasInSeat =
+        room.white?.username === me ||
+        room.black?.username === me;
+
       if (room.white?.username === me) room.white = null;
       if (room.black?.username === me) room.black = null;
       room.spectators.delete(me);
 
-      if (room.status === "playing") {
-        // if a seat drops, pause/finish
-        room.status = "waiting";
-        room.winner = null;
-        room.reason = null;
-        room.pending = null;
-        room.turnPlan = null;
+      if (wasInSeat) {
+        // ja paliek 1 cilvēks -> gaida + BOT pēc laika
+        if (room.status === "playing") {
+          room.status = "waiting";
+          room.winner = null;
+          room.reason = null;
+          room.pending = null;
+          room.turnPlan = null;
+          clearBotTimers(room);
+        }
+        scheduleBotIfWaiting(room);
+        io.to(room.id).emit("game:state", roomStatePayload(room));
       }
 
-      // remove empty rooms
-      const empty = !room.white && !room.black && room.spectators.size === 0;
-      if (empty) rooms.delete(room.id);
+      // ja nav neviena cilvēka, dzēšam room (lai bot rooms nekrājas)
+      const hasHuman =
+        (room.white && !seatIsBot(room.white)) ||
+        (room.black && !seatIsBot(room.black)) ||
+        (room.spectators && room.spectators.size > 0);
+
+      if (!hasHuman) {
+        clearBotTimers(room);
+        rooms.delete(room.id);
+      }
     }
 
     emitRoomList();
   });
 });
 
-// helper to find socket id by username
-function findSocketIdByUsername(username) {
-  if (!username) return null;
-  for (const [id, s] of io.of("/").sockets) {
-    if (s.username === username) return id;
-  }
-  return null;
-}
-
 server.listen(PORT, () => {
   console.log("Bugats Dambretes server running on port", PORT);
   console.log("Allowed origins:", ALLOWED_ORIGINS);
+  console.log("BOT_JOIN_WAIT_MS:", BOT_JOIN_WAIT_MS);
 });
