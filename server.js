@@ -8,7 +8,7 @@ import jwt from "jsonwebtoken";
 import multer from "multer";
 import path from "path";
 
-// MongoDB lietotāja modelis
+// MongoDB User Model
 const User = mongoose.model("User", {
   nickname: String,
   profilePic: String,
@@ -18,18 +18,19 @@ const User = mongoose.model("User", {
 const app = express();
 const PORT = process.env.PORT || 10080;
 const SIZE = 8;
+
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public"));  // Profila attēlu statiskā servēšana
+app.use(express.static("public")); // Serve profile images
 
-// Cloudinary konfigurācija
+// Cloudinary configuration
 cloudinary.config({
   cloud_name: 'your-cloud-name',
   api_key: 'your-api-key',
-  api_secret: 'your-api-secret'
+  api_secret: 'your-api-secret',
 });
 
-// Multer konfigurācija attēlu augšupielādei
+// Multer setup for image upload
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, "uploads/");
@@ -40,7 +41,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Reģistrācijas funkcija
+// User registration route
 app.post("/register", async (req, res) => {
   const { nickname, password, profilePic } = req.body;
   const newUser = new User({ nickname, password, profilePic, score: 0 });
@@ -48,7 +49,7 @@ app.post("/register", async (req, res) => {
   res.status(201).send("User created successfully!");
 });
 
-// Pieteikšanās funkcija
+// User login route
 app.post("/login", async (req, res) => {
   const { nickname, password } = req.body;
   const user = await User.findOne({ nickname, password });
@@ -61,7 +62,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// Profila attēlu augšupielāde
+// Profile picture upload route
 app.post("/uploadProfilePic", upload.single("profilePic"), (req, res) => {
   const filePath = req.file.path;
   cloudinary.uploader.upload(filePath, (error, result) => {
@@ -72,17 +73,17 @@ app.post("/uploadProfilePic", upload.single("profilePic"), (req, res) => {
   });
 });
 
-// Iegūt TOP 10 spēlētājus
+// Get top 10 players
 app.get("/leaderboard", async (req, res) => {
   const topPlayers = await User.find().sort({ score: -1 }).limit(10);
   res.status(200).json(topPlayers);
 });
 
-// Savienot ar MongoDB
+// MongoDB connection
 mongoose.connect("mongodb://localhost/dambretes", { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => app.listen(PORT, () => console.log("Server running on port 3000")));
+  .then(() => app.listen(PORT, () => console.log("Server running on port", PORT)));
 
-// Socket.IO konfigurācija
+// Socket.IO setup
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -91,7 +92,7 @@ const io = new Server(httpServer, {
   },
 });
 
-// Dambretes loģika
+// Checkers game logic
 function createInitialBoard() {
   const board = [];
   for (let r = 0; r < SIZE; r++) {
@@ -111,7 +112,7 @@ function createInitialBoard() {
   return board;
 }
 
-// Spēles loģika, istabas un sockets
+// Game rooms logic
 const rooms = new Map(); // roomId -> room
 
 function generateRoomId() {
@@ -129,13 +130,13 @@ function createRoom(hostSocket, nickname) {
   const room = {
     id,
     board,
-    currentPlayer: "b", // melnie sāk
+    currentPlayer: "b", // Black starts
     players: {
-      b: { socketId: hostSocket.id, nickname: nickname || "Spēlētājs" },
+      b: { socketId: hostSocket.id, nickname: nickname || "Player" },
       w: null,
     },
     mustContinueJump: false,
-    forceFrom: null, // {row,col} ja jāturpina ar to pašu
+    forceFrom: null, // {row,col} if the same piece must continue
     gameOver: false,
     winner: null, // "b" | "w" | null
   };
@@ -168,23 +169,23 @@ function broadcastLobby() {
 }
 
 io.on("connection", (socket) => {
-  console.log("Savienots:", socket.id);
-  socket.data.nickname = "Spēlētājs";
+  console.log("Connected:", socket.id);
+  socket.data.nickname = "Player";
   socket.data.roomId = null;
   socket.data.color = null;
 
   socket.on("joinLobby", (payload) => {
-    const nick = (payload && payload.nickname) || "Spēlētājs";
+    const nick = (payload && payload.nickname) || "Player";
     socket.data.nickname = String(nick).slice(0, 16);
     socket.emit("lobbyState", lobbySnapshot());
   });
 
   socket.on("createRoom", () => {
     if (!socket.data.nickname) {
-      socket.data.nickname = "Spēlētājs";
+      socket.data.nickname = "Player";
     }
 
-    // ja jau ir istabā – vispirms izņemam
+    // If already in a room, leave it first
     leaveCurrentRoom(socket);
 
     const room = createRoom(socket, socket.data.nickname);
@@ -203,17 +204,17 @@ io.on("connection", (socket) => {
   socket.on("joinRoom", (payload) => {
     const roomId = payload && payload.roomId;
     if (!roomId || !rooms.has(roomId)) {
-      socket.emit("errorMessage", { message: "Istaba neeksistē." });
+      socket.emit("errorMessage", { message: "Room doesn't exist." });
       return;
     }
 
     const room = rooms.get(roomId);
 
-    // ja pilna (2 spēlētāji) – nedodam iekšā
+    // If full (2 players) - don't allow more
     const occupied =
       (room.players.b ? 1 : 0) + (room.players.w ? 1 : 0);
     if (occupied >= 2) {
-      socket.emit("errorMessage", { message: "Istaba ir pilna (2/2)." });
+      socket.emit("errorMessage", { message: "Room is full (2/2)." });
       return;
     }
 
@@ -224,13 +225,13 @@ io.on("connection", (socket) => {
       color = "b";
       room.players.b = {
         socketId: socket.id,
-        nickname: socket.data.nickname || "Spēlētājs",
+        nickname: socket.data.nickname || "Player",
       };
     } else if (!room.players.w) {
       color = "w";
       room.players.w = {
         socketId: socket.id,
-        nickname: socket.data.nickname || "Spēlētājs",
+        nickname: socket.data.nickname || "Player",
       };
     }
 
@@ -253,7 +254,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    console.log("Atvienots:", socket.id);
+    console.log("Disconnected:", socket.id);
     leaveCurrentRoom(socket);
     broadcastLobby();
   });
@@ -290,5 +291,5 @@ function leaveCurrentRoom(socket) {
 }
 
 httpServer.listen(PORT, () => {
-  console.log("Bugats Dambrete serveris klausās uz porta", PORT);
+  console.log("Bugats Dambrete server running on port", PORT);
 });
