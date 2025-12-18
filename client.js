@@ -1,82 +1,172 @@
 const socket = io("https://bugats-dambrete-server.onrender.com");
 
-const boardEl = document.getElementById("dz-board");
+const connEl = document.getElementById("dz-connection-status");
+const nickInput = document.getElementById("dz-nickname");
+const connectBtn = document.getElementById("dz-connect-btn");
+const createRoomBtn = document.getElementById("dz-create-room-btn");
+const lobbyListEl = document.getElementById("dz-lobby-list");
+const yourInfoEl = document.getElementById("dz-your-info");
+
+const roomTitleEl = document.getElementById("dz-room-title");
+const leaveRoomBtn = document.getElementById("dz-leave-room-btn");
 const statusEl = document.getElementById("dz-status");
-const newGameBtn = document.getElementById("dz-new-game");
+const boardEl = document.getElementById("dz-board");
 
 const SIZE = 8;
-let board = [];
-let currentPlayer = "b"; // melnie
-let selected = null;
-let validMoves = [];
-let mustContinueJump = false;
-let gameOver = false;
+
+const state = {
+  connected: false,
+  nickname: null,
+  yourColor: null,
+  roomId: null,
+  board: [],
+  currentPlayer: null,
+  mustContinueJump: false,
+  forceFrom: null,
+  gameOver: false,
+  selected: null,
+  validMoves: [],
+};
 
 socket.on("connect", () => {
-  socket.emit("joinLobby", { nickname: "Spēlētājs" });
+  setConnectionUi(true);
+  const nickname = state.nickname || nickInput.value || "Spēlētājs";
+  socket.emit("joinLobby", { nickname });
+});
+
+socket.on("disconnect", () => {
+  setConnectionUi(false);
+  resetRoomState();
+});
+
+socket.on("lobbyState", (payload) => {
+  renderLobby(payload);
+});
+
+socket.on("roomJoined", (data) => {
+  const { room, yourColor } = data;
+  state.roomId = room.id;
+  state.yourColor = yourColor;
+  syncRoomState(room);
+  roomTitleEl.textContent = `Istaba ${room.id}`;
+  leaveRoomBtn.disabled = false;
+  renderYourInfo();
 });
 
 socket.on("roomState", (room) => {
-  board = room.board;
-  currentPlayer = room.currentPlayer;
-  renderBoard();
+  if (!state.roomId || state.roomId !== room.id) return;
+  syncRoomState(room);
 });
 
-function renderBoard() {
-  boardEl.innerHTML = "";
-  for (let r = 0; r < SIZE; r++) {
-    for (let c = 0; c < SIZE; c++) {
-      const square = document.createElement("div");
-      square.classList.add(
-        "dz-square",
-        (r + c) % 2 === 0 ? "dz-square-light" : "dz-square-dark"
-      );
-      square.dataset.row = r;
-      square.dataset.col = c;
+socket.on("leftRoom", () => {
+  resetRoomState();
+});
 
-      // Highlight for selected
-      if (selected && selected.row === r && selected.col === c) {
-        square.classList.add("dz-selected");
-      }
+socket.on("errorMessage", (payload) => {
+  if (payload && payload.message) {
+    statusEl.textContent = payload.message;
+  }
+});
 
-      const piece = board[r][c];
-      if (piece) {
-        const pieceEl = document.createElement("div");
-        pieceEl.classList.add(
-          "dz-piece",
-          piece.color === "b" ? "dz-piece-black" : "dz-piece-white"
-        );
-        square.appendChild(pieceEl);
-      }
+socket.on("invalidMove", (payload) => {
+  const reason = payload && payload.reason;
+  if (reason === "notYourTurn") return;
+  statusEl.textContent = "Nederīgs gājiens.";
+});
 
-      boardEl.appendChild(square);
-    }
+function setConnectionUi(online) {
+  state.connected = online;
+  if (online) {
+    connEl.textContent = "Online";
+    connEl.classList.add("dz-online");
+    connectBtn.disabled = true;
+    createRoomBtn.disabled = false;
+  } else {
+    connEl.textContent = "Atvienots";
+    connEl.classList.remove("dz-online");
+    connectBtn.disabled = false;
+    createRoomBtn.disabled = true;
   }
 }
 
-boardEl.addEventListener("click", (e) => {
-  if (gameOver) return;
-
-  const square = e.target.closest(".dz-square");
-  if (!square) return;
-
-  const row = parseInt(square.dataset.row, 10);
-  const col = parseInt(square.dataset.col, 10);
-
-  if (selected) {
-    socket.emit("makeMove", {
-      roomId: "some-room-id",
-      from: selected,
-      to: { row, col },
-    });
-    selected = null;
-  } else {
-    selected = { row, col };
+function renderYourInfo() {
+  if (!state.nickname) {
+    yourInfoEl.textContent = "";
+    return;
   }
+  const colorText =
+    state.yourColor === "b"
+      ? "Tu spēlē ar melnajiem (augšā)."
+      : state.yourColor === "w"
+      ? "Tu spēlē ar baltajiem (apakšā)."
+      : "Tu vēl neesi istabā.";
+  yourInfoEl.textContent = `${state.nickname} – ${colorText}`;
+}
 
+function renderLobby(lobby) {
+  lobbyListEl.innerHTML = "";
+  if (!lobby || !lobby.rooms || lobby.rooms.length === 0) {
+    lobbyListEl.textContent = "Pašlaik nav nevienas istabas.";
+    return;
+  }
+  lobby.rooms.forEach((room) => {
+    const row = document.createElement("div");
+    row.className = "dz-room-row";
+
+    const meta = document.createElement("div");
+    meta.className = "dz-room-meta";
+
+    const idSpan = document.createElement("div");
+    idSpan.className = "dz-room-id";
+    idSpan.textContent = `Istaba ${room.id}`;
+
+    const playersSpan = document.createElement("div");
+    playersSpan.className = "dz-room-players";
+
+    const listNames =
+      room.players && room.players.length
+        ? room.players.map((p) => `${p.nickname} (${p.color})`).join(", ")
+        : "tukša";
+    playersSpan.textContent = `${room.playerCount}/2 – ${listNames}`;
+
+    meta.appendChild(idSpan);
+    meta.appendChild(playersSpan);
+
+    const joinBtn = document.createElement("button");
+    joinBtn.className = "dz-room-join-btn";
+    joinBtn.textContent = "Pievienoties";
+    joinBtn.disabled = room.playerCount >= 2;
+
+    joinBtn.addEventListener("click", () => {
+      if (!state.connected) return;
+      socket.emit("joinRoom", { roomId: room.id });
+    });
+
+    row.appendChild(meta);
+    row.appendChild(joinBtn);
+    lobbyListEl.appendChild(row);
+  });
+}
+
+function resetRoomState() {
+  state.roomId = null;
+  state.yourColor = null;
+  state.board = [];
+  state.currentPlayer = null;
+  state.mustContinueJump = false;
+  state.forceFrom = null;
+  state.gameOver = false;
+  state.selected = null;
+  state.validMoves = [];
+  roomTitleEl.textContent = "Nav pieslēgts istabai";
+  leaveRoomBtn.disabled = true;
+  statusEl.classList.remove("dz-gameover");
+  statusEl.textContent =
+    "Pieslēdzies serverim, izvēlies istabu vai izveido jaunu.";
   renderBoard();
-});
+  renderYourInfo();
+}
 
-newGameBtn.addEventListener("click", () => {
-  socket.emit("createRoom");
-});
+// ===== Socket.IO Event handlers =====
+
+socket.emit("createRoom");
