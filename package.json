@@ -11,6 +11,6 @@
     "cors": "^2.8.5",
     "express": "^4.19.0",
     "socket.io": "^4.7.4",
-    "mongoose": "^6.0.0"  // Pievienotais mongoose
+    "mongoose": "^6.0.0"
   }
 }
