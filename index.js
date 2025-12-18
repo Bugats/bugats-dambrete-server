@@ -1,4 +1,5 @@
 const express = require('express');
+const path = require('path');
 const http = require('http');
 const socketIo = require('socket.io');
 
@@ -6,30 +7,37 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server);
 
+// Statiskie faili (HTML, CSS, JS)
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Ielādē index.html, kad tiek apmeklēta mājas lapa
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Socket.IO komunikācija
 let players = [];
 let leaderboard = [];
-
-app.use(express.static('public'));  // Servē front-end failus
 
 io.on('connection', (socket) => {
   console.log('A player connected');
 
-  // Piešķir spēlētājam sākotnējo avataru
+  // Saglabā spēlētāju un norāda avataru
   players.push({ id: socket.id, xp: 0, avatar: 'default-avatar.png' });
 
-  // Atjaunina spēlētāju skaitu
+  // Nosūta spēlētāju skaitu visiem spēlētājiem
   io.emit('playerCount', players.length);
 
-  // Atjaunina leaderboard
+  // Nosūta leaderboard visiem spēlētājiem
   io.emit('leaderboardUpdate', leaderboard);
 
-  // Spēlētāja diskešanas gadījumā
+  // Spēlētāja atvienošanās
   socket.on('disconnect', () => {
     players = players.filter(player => player.id !== socket.id);
     io.emit('playerCount', players.length);
   });
 
-  // Iestatīt avatāru
+  // Spēlētāja avatāra iestatīšana
   socket.on('setAvatar', (avatar) => {
     const player = players.find(player => player.id === socket.id);
     if (player) {
@@ -37,13 +45,13 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Pievienot XP un atjaunināt leaderboard
+  // Spēlētāja gājiena paziņošana
   socket.on('playerMove', (moveData) => {
     let winner = determineWinner(moveData);
     if (winner) {
       let player = leaderboard.find(player => player.id === winner.id);
       if (player) {
-        player.xp += 10;
+        player.xp += 10; // Pievieno XP
       } else {
         leaderboard.push({ id: winner.id, name: winner.name, xp: 10 });
       }
@@ -52,13 +60,15 @@ io.on('connection', (socket) => {
   });
 });
 
-// Funkcija, lai noteiktu uzvarētāju
+// Funkcija, lai noteiktu uzvarētāju (pamata loģika)
 function determineWinner(moveData) {
-  // Loģika, lai noteiktu uzvarētāju
-  // Atgriež uzvarētāju, ja ir uzvarētājs
+  // Piemēram, uzvarētājs tiek noteikts pēc gājiena
+  // Tev būs jāievieš konkrēta spēles loģika
   return { id: moveData.playerId, name: moveData.playerName };
 }
 
-server.listen(3000, () => {
-  console.log('Server running on port 3000');
+// Servera palaišana
+const port = process.env.PORT || 3000;
+server.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
