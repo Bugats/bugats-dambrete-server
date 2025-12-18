@@ -2,20 +2,6 @@ import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import cors from "cors";
-import mongoose from "mongoose";
-import cloudinary from "cloudinary";
-import jwt from "jsonwebtoken";
-import multer from "multer";
-import path from "path";
-import bcrypt from "bcryptjs";
-
-// MongoDB User Model
-const User = mongoose.model("User", {
-  nickname: String,
-  password: String, // Store password as a hash
-  profilePic: String,
-  score: Number,
-});
 
 const app = express();
 const PORT = process.env.PORT || 10080;
@@ -23,78 +9,8 @@ const SIZE = 8;
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public")); // Serve profile images
 
-// Cloudinary configuration
-cloudinary.config({
-  cloud_name: 'your-cloud-name',
-  api_key: 'your-api-key',
-  api_secret: 'your-api-secret',
-});
-
-// Multer setup for image upload
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "uploads/");
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  },
-});
-const upload = multer({ storage });
-
-// User registration route
-app.post("/register", async (req, res) => {
-  const { nickname, password, profilePic } = req.body;
-
-  // Hash the password before saving
-  const hashedPassword = bcrypt.hashSync(password, 10);
-  const newUser = new User({ nickname, password: hashedPassword, profilePic, score: 0 });
-  await newUser.save();
-  res.status(201).send("User created successfully!");
-});
-
-// User login route
-app.post("/login", async (req, res) => {
-  const { nickname, password } = req.body;
-  const user = await User.findOne({ nickname });
-
-  if (user && bcrypt.compareSync(password, user.password)) {
-    const token = jwt.sign({ userId: user._id }, "your-secret-key");
-    res.status(200).json({ token });
-  } else {
-    res.status(400).send("Invalid credentials");
-  }
-});
-
-// Profile picture upload route
-app.post("/uploadProfilePic", upload.single("profilePic"), (req, res) => {
-  const filePath = req.file.path;
-  cloudinary.uploader.upload(filePath, (error, result) => {
-    if (error) {
-      return res.status(500).send("Error uploading image");
-    }
-    res.status(200).json({ imageUrl: result.url });
-  });
-});
-
-// Get top 10 players
-app.get("/leaderboard", async (req, res) => {
-  const topPlayers = await User.find().sort({ score: -1 }).limit(10);
-  res.status(200).json(topPlayers);
-});
-
-// MongoDB connection
-mongoose.connect("mongodb://localhost/dambretes", { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => {
-    console.log("Connected to MongoDB");
-    app.listen(PORT, () => console.log("Server running on port", PORT));
-  })
-  .catch(err => {
-    console.error("MongoDB connection error:", err);
-  });
-
-// Socket.IO setup
+// Socket.IO konfigurācija
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -103,7 +19,7 @@ const io = new Server(httpServer, {
   },
 });
 
-// Checkers game logic
+// Spēles dēļa sākotnējais stāvoklis
 function createInitialBoard() {
   const board = [];
   for (let r = 0; r < SIZE; r++) {
@@ -112,9 +28,9 @@ function createInitialBoard() {
       let piece = null;
       const dark = (r + c) % 2 === 1;
       if (dark && r < 3) {
-        piece = { color: "b", king: false };
+        piece = { color: "b", king: false }; // melnie kauliņi
       } else if (dark && r > 4) {
-        piece = { color: "w", king: false };
+        piece = { color: "w", king: false }; // baltie kauliņi
       }
       row.push(piece);
     }
@@ -123,9 +39,10 @@ function createInitialBoard() {
   return board;
 }
 
-// Game rooms logic
+// Istabas stāvoklis
 const rooms = new Map(); // roomId -> room
 
+// Jaunas istabas ģenerēšana
 function generateRoomId() {
   const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let id = "";
@@ -135,19 +52,18 @@ function generateRoomId() {
   return id;
 }
 
+// Istabas izveide
 function createRoom(hostSocket, nickname) {
   const id = generateRoomId();
   const board = createInitialBoard();
   const room = {
     id,
     board,
-    currentPlayer: "b", // Black starts
+    currentPlayer: "b", // melnie sāk
     players: {
-      b: { socketId: hostSocket.id, nickname: nickname || "Player" },
+      b: { socketId: hostSocket.id, nickname: nickname || "Spēlētājs" },
       w: null,
     },
-    mustContinueJump: false,
-    forceFrom: null, // {row,col} if the same piece must continue
     gameOver: false,
     winner: null, // "b" | "w" | null
   };
@@ -155,50 +71,25 @@ function createRoom(hostSocket, nickname) {
   return room;
 }
 
-function lobbySnapshot() {
-  const list = [];
-  for (const room of rooms.values()) {
-    const playerList = [];
-    if (room.players.b) {
-      playerList.push({ color: "b", nickname: room.players.b.nickname });
-    }
-    if (room.players.w) {
-      playerList.push({ color: "w", nickname: room.players.w.nickname });
-    }
-    list.push({
-      id: room.id,
-      playerCount: playerList.length,
-      players: playerList,
-      gameOver: room.gameOver,
-    });
-  }
-  return { rooms: list };
-}
-
-function broadcastLobby() {
-  io.emit("lobbyState", lobbySnapshot());
-}
-
+// Socket.IO notikumi
 io.on("connection", (socket) => {
-  console.log("Connected:", socket.id);
-  socket.data.nickname = "Player";
+  console.log("Savienots:", socket.id);
+  socket.data.nickname = "Spēlētājs";
   socket.data.roomId = null;
   socket.data.color = null;
 
+  // Pievienoties istabai
   socket.on("joinLobby", (payload) => {
-    const nick = (payload && payload.nickname) || "Player";
+    const nick = (payload && payload.nickname) || "Spēlētājs";
     socket.data.nickname = String(nick).slice(0, 16);
-    socket.emit("lobbyState", lobbySnapshot());
+    socket.emit("lobbyState", { rooms: Array.from(rooms.values()) });
   });
 
+  // Izveidot istabu
   socket.on("createRoom", () => {
     if (!socket.data.nickname) {
-      socket.data.nickname = "Player";
+      socket.data.nickname = "Spēlētājs";
     }
-
-    // If already in a room, leave it first
-    leaveCurrentRoom(socket);
-
     const room = createRoom(socket, socket.data.nickname);
     socket.join(room.id);
     socket.data.roomId = room.id;
@@ -209,41 +100,30 @@ io.on("connection", (socket) => {
       yourColor: "b",
     });
     io.to(room.id).emit("roomState", room);
-    broadcastLobby();
   });
 
+  // Pievienoties esošai istabai
   socket.on("joinRoom", (payload) => {
     const roomId = payload && payload.roomId;
     if (!roomId || !rooms.has(roomId)) {
-      socket.emit("errorMessage", { message: "Room doesn't exist." });
+      socket.emit("errorMessage", { message: "Istaba neeksistē." });
       return;
     }
 
     const room = rooms.get(roomId);
-
-    // If full (2 players) - don't allow more
-    const occupied =
-      (room.players.b ? 1 : 0) + (room.players.w ? 1 : 0);
-    if (occupied >= 2) {
-      socket.emit("errorMessage", { message: "Room is full (2/2)." });
+    if (room.players.b && room.players.w) {
+      socket.emit("errorMessage", { message: "Istaba ir pilna." });
       return;
     }
 
-    leaveCurrentRoom(socket);
-
+    // Piešķirt otro spēlētāju
     let color = null;
     if (!room.players.b) {
       color = "b";
-      room.players.b = {
-        socketId: socket.id,
-        nickname: socket.data.nickname || "Player",
-      };
-    } else if (!room.players.w) {
+      room.players.b = { socketId: socket.id, nickname: socket.data.nickname || "Spēlētājs" };
+    } else {
       color = "w";
-      room.players.w = {
-        socketId: socket.id,
-        nickname: socket.data.nickname || "Player",
-      };
+      room.players.w = { socketId: socket.id, nickname: socket.data.nickname || "Spēlētājs" };
     }
 
     socket.join(room.id);
@@ -255,52 +135,74 @@ io.on("connection", (socket) => {
       yourColor: color,
     });
     io.to(room.id).emit("roomState", room);
-    broadcastLobby();
   });
 
+  // Atstāt istabu
   socket.on("leaveRoom", () => {
     leaveCurrentRoom(socket);
     socket.emit("leftRoom");
-    broadcastLobby();
+  });
+
+  // Gājiens
+  socket.on("makeMove", (payload) => {
+    const roomId = socket.data.roomId;
+    const color = socket.data.color;
+    if (!roomId || !color || !rooms.has(roomId)) {
+      socket.emit("invalidMove", { reason: "notInRoom" });
+      return;
+    }
+
+    const room = rooms.get(roomId);
+    const { from, to } = payload || {};
+    if (!from || !to) {
+      socket.emit("invalidMove", { reason: "badPayload" });
+      return;
+    }
+
+    // Pārbauda un piemēro gājienu
+    const result = tryMakeMove(room, color, from.row, from.col, to.row, to.col);
+
+    if (!result.ok) {
+      socket.emit("invalidMove", { reason: result.reason });
+      return;
+    }
+
+    io.to(room.id).emit("roomState", room);
   });
 
   socket.on("disconnect", () => {
-    console.log("Disconnected:", socket.id);
+    console.log("Atvienots:", socket.id);
     leaveCurrentRoom(socket);
-    broadcastLobby();
   });
-});
 
-function leaveCurrentRoom(socket) {
-  const roomId = socket.data.roomId;
-  if (!roomId || !rooms.has(roomId)) {
+  function leaveCurrentRoom(socket) {
+    const roomId = socket.data.roomId;
+    if (!roomId || !rooms.has(roomId)) {
+      socket.data.roomId = null;
+      socket.data.color = null;
+      return;
+    }
+
+    const room = rooms.get(roomId);
+    if (room.players.b && room.players.b.socketId === socket.id) {
+      room.players.b = null;
+    } else if (room.players.w && room.players.w.socketId === socket.id) {
+      room.players.w = null;
+    }
+
+    socket.leave(roomId);
     socket.data.roomId = null;
     socket.data.color = null;
-    return;
+
+    if (!room.players.b && !room.players.w) {
+      rooms.delete(roomId);
+    } else {
+      io.to(room.id).emit("roomState", room);
+    }
   }
+});
 
-  const room = rooms.get(roomId);
-
-  if (room.players.b && room.players.b.socketId === socket.id) {
-    room.players.b = null;
-  }
-  if (room.players.w && room.players.w.socketId === socket.id) {
-    room.players.w = null;
-  }
-
-  socket.leave(roomId);
-  socket.data.roomId = null;
-  socket.data.color = null;
-
-  const someoneLeft =
-    (room.players.b ? 1 : 0) + (room.players.w ? 1 : 0);
-  if (someoneLeft === 0) {
-    rooms.delete(roomId);
-  } else {
-    io.to(room.id).emit("roomState", room);
-  }
-}
-
+// Serveris klausās uz portu
 httpServer.listen(PORT, () => {
-  console.log("Bugats Dambrete server running on port", PORT);
+  console.log("Serveris darbojas uz porta", PORT);
 });
