@@ -1,13 +1,10 @@
 {
-  "name": "bugats-dambrete",
+  "name": "bugats-dambrete-server",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
-  "private": true,
   "scripts": {
     "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
