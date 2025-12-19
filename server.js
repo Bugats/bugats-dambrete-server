@@ -20,7 +20,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   .filter(Boolean);
 
 // ===== BOT konfigurācija =====
-const BOT_JOIN_WAIT_MS = parseInt(process.env.BOT_JOIN_WAIT_MS || "10000", 10); // 10s
+const BOT_JOIN_WAIT_MS = parseInt(process.env.BOT_JOIN_WAIT_MS || "60000", 10); // 60s
 const BOT_THINK_MIN_MS = parseInt(process.env.BOT_THINK_MIN_MS || "450", 10);
 const BOT_THINK_MAX_MS = parseInt(process.env.BOT_THINK_MAX_MS || "900", 10);
 
