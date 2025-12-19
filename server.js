@@ -530,6 +530,9 @@ function makeBotSeat(roomId, color) {
 function seatIsBot(seat) {
   return !!seat?.isBot || (typeof seat?.username === "string" && seat.username.startsWith("BOT_"));
 }
+function seatIsHuman(seat) {
+  return !!seat && !seatIsBot(seat);
+}
 function botColor(room) {
   if (seatIsBot(room.white)) return "w";
   if (seatIsBot(room.black)) return "b";
@@ -543,6 +546,45 @@ function botUsername(room) {
 function otherHumanUsername(room, myColor) {
   if (myColor === "w") return room.black && !seatIsBot(room.black) ? room.black.username : null;
   return room.white && !seatIsBot(room.white) ? room.white.username : null;
+}
+
+// ✅ FIX: garantēta alternācija pret BOT (WHITE ↔ BLACK katrā jaunajā spēlē)
+function prepareVsBotAlternation(room, { forceBotIfSolo } = {}) {
+  const wHuman = seatIsHuman(room.white);
+  const bHuman = seatIsHuman(room.black);
+
+  const wBot = seatIsBot(room.white);
+  const bBot = seatIsBot(room.black);
+
+  const humanCount = (wHuman ? 1 : 0) + (bHuman ? 1 : 0);
+  const botCount = (wBot ? 1 : 0) + (bBot ? 1 : 0);
+
+  const isVsBot =
+    humanCount === 1 && (botCount === 1 || (botCount === 0 && forceBotIfSolo));
+
+  if (!isVsBot) return false;
+
+  const humanSeat = wHuman ? room.white : room.black;
+  const currentHumanColor = wHuman ? "w" : "b";
+
+  // normalizējam, lai vsBotAlt atbilst tam, kur cilvēks ir ŠOBRĪD (pirms flip)
+  const shouldBe = currentHumanColor === "b";
+  if (typeof room.vsBotAlt !== "boolean") room.vsBotAlt = shouldBe;
+  if (room.vsBotAlt !== shouldBe) room.vsBotAlt = shouldBe;
+
+  // flip uz pretējo krāsu
+  room.vsBotAlt = !room.vsBotAlt;
+
+  // vsBotAlt === true => cilvēks BLACK, citādi WHITE
+  if (room.vsBotAlt) {
+    room.black = { username: humanSeat.username, avatarUrl: humanSeat.avatarUrl || "" };
+    room.white = makeBotSeat(room.id, "w");
+  } else {
+    room.white = { username: humanSeat.username, avatarUrl: humanSeat.avatarUrl || "" };
+    room.black = makeBotSeat(room.id, "b");
+  }
+
+  return true;
 }
 
 function roomStatePayload(room) {
@@ -674,9 +716,13 @@ function scheduleBotIfWaiting(room) {
     const wH = current.white && !seatIsBot(current.white);
     const bH = current.black && !seatIsBot(current.black);
 
-    if (wH && !current.black) current.black = makeBotSeat(current.id, "b");
-    else if (bH && !current.white) current.white = makeBotSeat(current.id, "w");
-    else return;
+    if (wH && !current.black) {
+      current.black = makeBotSeat(current.id, "b");
+      current.vsBotAlt = false; // cilvēks šobrīd WHITE
+    } else if (bH && !current.white) {
+      current.white = makeBotSeat(current.id, "w");
+      current.vsBotAlt = true; // cilvēks šobrīd BLACK
+    } else return;
 
     current.status = "playing";
     current.winner = null;
@@ -795,8 +841,11 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true, swapColors = true } 
   clearBotTimers(room);
   clearRankedTimer(room);
 
-  // ✅ GODĪGA MAIŅA: ja ir abi sēdekļi (white+black), katrai nākamajai spēlei apmainām krāsas
- if (swapColors && room.white && room.black && !seatIsBot(room.white) && !seatIsBot(room.black)) {
+  // ✅ 1) VS BOT: garantēta alternācija (katru nākamo spēli maina cilvēka krāsu)
+  const handledVsBot = prepareVsBotAlternation(room, { forceBotIfSolo });
+
+  // ✅ 2) PvP: godīga krāsu maiņa (swap), ja nav VS BOT
+  if (!handledVsBot && swapColors && room.white && room.black) {
     const tmp = room.white;
     room.white = room.black;
     room.black = tmp;
@@ -822,16 +871,6 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true, swapColors = true } 
   room.ranked.reason = null;
   room.ranked.awarded = false;
   room.ranked.timer = null;
-
-  const bothSeatsPresent = !!room.white && !!room.black;
-
-  if (!bothSeatsPresent && forceBotIfSolo) {
-    const wHuman = room.white && !seatIsBot(room.white);
-    const bHuman = room.black && !seatIsBot(room.black);
-
-    if (wHuman && !room.black) room.black = makeBotSeat(room.id, "b");
-    else if (bHuman && !room.white) room.white = makeBotSeat(room.id, "w");
-  }
 
   if (room.white && room.black) room.status = "playing";
   else room.status = "waiting";
@@ -1056,7 +1095,8 @@ io.on("connection", async (socket) => {
       botTimer: null,
       botThinkTimer: null,
       ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
-      rematch: { w: false, b: false }
+      rematch: { w: false, b: false },
+      vsBotAlt: false
     };
 
     room.white = { username: u.username, avatarUrl: u.avatarUrl };
@@ -1069,6 +1109,7 @@ io.on("connection", async (socket) => {
       room.black = makeBotSeat(room.id, "b");
       room.status = "playing";
       room.rematch = { w: false, b: false };
+      room.vsBotAlt = false; // cilvēks šobrīd WHITE
       io.to(room.id).emit("game:state", roomStatePayload(room));
       emitRoomList();
       sendTurnMoves(room);
@@ -1110,7 +1151,8 @@ io.on("connection", async (socket) => {
         botTimer: null,
         botThinkTimer: null,
         ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
-        rematch: { w: false, b: false }
+        rematch: { w: false, b: false },
+        vsBotAlt: false
       };
 
       rooms.set(id, room);
