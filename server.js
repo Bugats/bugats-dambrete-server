@@ -796,7 +796,7 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true, swapColors = true } 
   clearRankedTimer(room);
 
   // ✅ GODĪGA MAIŅA: ja ir abi sēdekļi (white+black), katrai nākamajai spēlei apmainām krāsas
-  if (swapColors && room.white && room.black) {
+ if (swapColors && room.white && room.black && !seatIsBot(room.white) && !seatIsBot(room.black)) {
     const tmp = room.white;
     room.white = room.black;
     room.black = tmp;
