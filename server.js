@@ -843,46 +843,6 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true, swapColors = true } 
     room.ranked.eligible = false;
   }
 }
-  room.board = initialBoard();
-  room.turn = "w";
-  room.status = "waiting";
-
-  room.pending = null;
-  room.turnPlan = null;
-  room.winner = null;
-  room.reason = null;
-  room.lastMove = null;
-
-  room.rematch = { w: false, b: false };
-
-  ensureRanked(room);
-  room.ranked.status = "none";
-  room.ranked.winner = null;
-  room.ranked.loser = null;
-  room.ranked.deadline = null;
-  room.ranked.reason = null;
-  room.ranked.awarded = false;
-  room.ranked.timer = null;
-
-  const bothSeatsPresent = !!room.white && !!room.black;
-
-  if (!bothSeatsPresent && forceBotIfSolo) {
-    const wHuman = room.white && !seatIsBot(room.white);
-    const bHuman = room.black && !seatIsBot(room.black);
-
-    if (wHuman && !room.black) room.black = makeBotSeat(room.id, "b");
-    else if (bHuman && !room.white) room.white = makeBotSeat(room.id, "w");
-  }
-
-  if (room.white && room.black) room.status = "playing";
-  else room.status = "waiting";
-
-  if (room.white && room.black && !seatIsBot(room.white) && !seatIsBot(room.black)) {
-    room.ranked.eligible = true;
-  } else {
-    room.ranked.eligible = false;
-  }
-}
 
 function sendTurnMoves(room) {
   if (!room || room.status !== "playing") return;
