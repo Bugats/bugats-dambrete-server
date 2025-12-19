@@ -1,650 +1,1081 @@
-import express from "express";
-import cors from "cors";
-import http from "http";
-import { Server } from "socket.io";
-import fs from "fs";
-import path from "path";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import multer from "multer";
+const fs = require("fs");
+const fsp = require("fs/promises");
+const path = require("path");
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
+const { Server } = require("socket.io");
 
 const PORT = process.env.PORT || 10080;
-const JWT_SECRET = process.env.JWT_SECRET || "BUGATS_DAMBRETE_SECRET";
-const DATA_FILE = path.join(process.cwd(), "users.json");
-const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+const JWT_SECRET = process.env.JWT_SECRET || "BUGATS_DAMBRETE_SECRET_CHANGE_ME";
 
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ users: [] }, null, 2));
+// Ieteikums: Render ENV ieliec:
+// ALLOWED_ORIGINS=https://thezone.lv,https://www.thezone.lv,http://localhost:5500,http://127.0.0.1:5500
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  "https://thezone.lv,https://www.thezone.lv,http://localhost:5500,http://127.0.0.1:5500")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-function readDB() {
+// ===== BOT konfigurācija =====
+const BOT_JOIN_WAIT_MS = parseInt(process.env.BOT_JOIN_WAIT_MS || "10000", 10); // 10s
+const BOT_THINK_MIN_MS = parseInt(process.env.BOT_THINK_MIN_MS || "450", 10);
+const BOT_THINK_MAX_MS = parseInt(process.env.BOT_THINK_MAX_MS || "900", 10);
+
+const ROOT = __dirname;
+const DATA_DIR = path.join(ROOT, "data");
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+const UPLOADS_DIR = path.join(ROOT, "uploads");
+const AVATARS_DIR = path.join(UPLOADS_DIR, "avatars");
+const PUBLIC_DIR = path.join(ROOT, "public");
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+ensureDir(DATA_DIR);
+ensureDir(UPLOADS_DIR);
+ensureDir(AVATARS_DIR);
+ensureDir(PUBLIC_DIR);
+if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "{}", "utf8");
+
+// ---- atomic JSON write queue ----
+let writeQueue = Promise.resolve();
+function atomicWriteJSON(file, obj) {
+  writeQueue = writeQueue.then(async () => {
+    const tmp = file + ".tmp";
+    await fsp.writeFile(tmp, JSON.stringify(obj, null, 2), "utf8");
+    await fsp.rename(tmp, file);
+  });
+  return writeQueue;
+}
+
+async function readUsers() {
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    const raw = await fsp.readFile(USERS_FILE, "utf8");
+    const json = JSON.parse(raw || "{}");
+    return json && typeof json === "object" ? json : {};
   } catch {
-    return { users: [] };
+    return {};
   }
 }
-function writeDB(db) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
-}
 
-function publicUser(u) {
+function safeUserPublic(u) {
   return {
     username: u.username,
     avatarUrl: u.avatarUrl || "",
-    stats: u.stats || { rating: 1000, xp: 0, wins: 0, losses: 0 }
+    stats: u.stats || { wins: 0, losses: 0, draws: 0, xp: 0, rating: 1000 },
   };
 }
 
-function signToken(username) {
-  return jwt.sign({ username }, JWT_SECRET, { expiresIn: "30d" });
+function computeTop10(users) {
+  const arr = Object.values(users).map((u) => ({
+    username: u.username,
+    avatarUrl: u.avatarUrl || "",
+    wins: u.stats?.wins || 0,
+    losses: u.stats?.losses || 0,
+    xp: u.stats?.xp || 0,
+    rating: u.stats?.rating ?? 1000,
+  }));
+  arr.sort((a, b) => b.rating - a.rating || b.wins - a.wins || b.xp - a.xp);
+  return arr.slice(0, 10);
 }
 
-function authHttp(req, res, next) {
-  const h = req.headers.authorization || "";
-  const m = h.match(/^Bearer (.+)$/);
-  if (!m) return res.status(401).json({ error: "NO_TOKEN" });
-  try {
-    req.user = jwt.verify(m[1], JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: "BAD_TOKEN" });
-  }
-}
-
+// ---- Express ----
 const app = express();
-app.use(cors({ origin: true, credentials: true }));
+app.set("trust proxy", 1);
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error("CORS blocked: " + origin));
+    },
+    credentials: true,
+  })
+);
+
 app.use(express.json({ limit: "1mb" }));
-app.use("/uploads", express.static(UPLOAD_DIR));
+app.use(express.static(PUBLIC_DIR));
+app.use("/uploads", express.static(UPLOADS_DIR));
 
-app.post("/api/signup", (req, res) => {
-  const username = String(req.body.username || "").trim();
-  const password = String(req.body.password || "");
+// ---- Auth helpers ----
+function signToken(username) {
+  return jwt.sign({ u: username }, JWT_SECRET, { expiresIn: "30d" });
+}
 
-  if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) return res.status(400).json({ error: "BAD_USERNAME" });
-  if (password.length < 6) return res.status(400).json({ error: "BAD_PASSWORD" });
-
-  const db = readDB();
-  if (db.users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
-    return res.status(400).json({ error: "USER_EXISTS" });
+function authMiddleware(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload.u;
+    return next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
   }
+}
 
-  const passHash = bcrypt.hashSync(password, 10);
-  const user = {
-    username,
-    passHash,
-    avatarUrl: "",
-    stats: { rating: 1000, xp: 0, wins: 0, losses: 0 }
-  };
-  db.users.push(user);
-  writeDB(db);
+function validUsername(s) {
+  return typeof s === "string" && /^[a-zA-Z0-9_]{3,16}$/.test(s);
+}
+function validPassword(s) {
+  return typeof s === "string" && s.length >= 6 && s.length <= 64;
+}
 
-  const token = signToken(username);
-  return res.json({ token, user: publicUser(user) });
-});
-
-app.post("/api/login", (req, res) => {
-  const username = String(req.body.username || "").trim();
-  const password = String(req.body.password || "");
-
-  const db = readDB();
-  const user = db.users.find(u => u.username.toLowerCase() === username.toLowerCase());
-  if (!user) return res.status(400).json({ error: "BAD_LOGIN" });
-  if (!bcrypt.compareSync(password, user.passHash)) return res.status(400).json({ error: "BAD_LOGIN" });
-
-  const token = signToken(user.username);
-  return res.json({ token, user: publicUser(user) });
-});
-
-app.get("/api/me", authHttp, (req, res) => {
-  const db = readDB();
-  const user = db.users.find(u => u.username === req.user.username);
-  if (!user) return res.status(404).json({ error: "NO_USER" });
-  return res.json({ user: publicUser(user) });
-});
-
+// ---- Multer (avatar upload) ----
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-  filename: (_req, file, cb) => {
+  destination: (req, file, cb) => cb(null, AVATARS_DIR),
+  filename: (req, file, cb) => {
     const ext = (path.extname(file.originalname) || "").toLowerCase();
     const safeExt = [".png", ".jpg", ".jpeg", ".webp"].includes(ext) ? ext : ".png";
-    cb(null, `ava_${Date.now()}_${Math.random().toString(16).slice(2)}${safeExt}`);
-  }
+    cb(null, `${req.user}_${Date.now()}${safeExt}`);
+  },
 });
-const upload = multer({ storage });
-
-app.post("/api/avatar", authHttp, upload.single("avatar"), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "NO_FILE" });
-  const db = readDB();
-  const user = db.users.find(u => u.username === req.user.username);
-  if (!user) return res.status(404).json({ error: "NO_USER" });
-
-  user.avatarUrl = `/uploads/${req.file.filename}`;
-  writeDB(db);
-  return res.json({ avatarUrl: user.avatarUrl });
+const upload = multer({
+  storage,
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = ["image/png", "image/jpeg", "image/webp"].includes(file.mimetype);
+    cb(ok ? null : new Error("Only PNG/JPG/WEBP allowed"), ok);
+  },
 });
 
-app.get("/api/leaderboard/top10", (_req, res) => {
-  const db = readDB();
-  const top = [...db.users]
-    .sort((a, b) => (b.stats?.rating ?? 1000) - (a.stats?.rating ?? 1000))
-    .slice(0, 10)
-    .map(u => ({
-      username: u.username,
-      avatarUrl: u.avatarUrl || "",
-      rating: u.stats?.rating ?? 1000,
-      xp: u.stats?.xp ?? 0,
-      wins: u.stats?.wins ?? 0
-    }));
-  res.json({ top10: top });
+// ---- API ----
+app.post("/api/signup", async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!validUsername(username)) return res.status(400).json({ ok: false, error: "BAD_USERNAME" });
+  if (!validPassword(password)) return res.status(400).json({ ok: false, error: "BAD_PASSWORD" });
+
+  const users = await readUsers();
+  const key = username.toLowerCase();
+  if (users[key]) return res.status(409).json({ ok: false, error: "USERNAME_TAKEN" });
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  users[key] = {
+    username,
+    passwordHash,
+    avatarUrl: "",
+    createdAt: Date.now(),
+    stats: { wins: 0, losses: 0, draws: 0, xp: 0, rating: 1000 },
+  };
+  await atomicWriteJSON(USERS_FILE, users);
+
+  const token = signToken(username);
+  return res.json({ ok: true, token, user: safeUserPublic(users[key]) });
 });
 
+app.post("/api/login", async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!validUsername(username)) return res.status(400).json({ ok: false, error: "BAD_USERNAME" });
+  if (!validPassword(password)) return res.status(400).json({ ok: false, error: "BAD_PASSWORD" });
+
+  const users = await readUsers();
+  const key = username.toLowerCase();
+  const u = users[key];
+  if (!u) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
+
+  const ok = await bcrypt.compare(password, u.passwordHash);
+  if (!ok) return res.status(401).json({ ok: false, error: "INVALID_LOGIN" });
+
+  const token = signToken(u.username);
+  return res.json({ ok: true, token, user: safeUserPublic(u) });
+});
+
+app.get("/api/me", authMiddleware, async (req, res) => {
+  const users = await readUsers();
+  const key = req.user.toLowerCase();
+  const u = users[key];
+  if (!u) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  return res.json({ ok: true, user: safeUserPublic(u) });
+});
+
+app.post("/api/avatar", authMiddleware, upload.single("avatar"), async (req, res) => {
+  const users = await readUsers();
+  const key = req.user.toLowerCase();
+  const u = users[key];
+  if (!u) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+  const file = req.file;
+  if (!file) return res.status(400).json({ ok: false, error: "NO_FILE" });
+
+  u.avatarUrl = `/uploads/avatars/${file.filename}`;
+  users[key] = u;
+  await atomicWriteJSON(USERS_FILE, users);
+
+  return res.json({ ok: true, avatarUrl: u.avatarUrl });
+});
+
+app.get("/api/leaderboard", async (req, res) => {
+  const users = await readUsers();
+  return res.json({ ok: true, top10: computeTop10(users) });
+});
+
+// ---- Socket.IO ----
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: true, credentials: true }
+  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"], credentials: true },
 });
 
-// ====== Rooms + Game engine (Krievu dambrete) ======
-const rooms = new Map(); // id -> room
-let onlineCount = 0;
-
-function genRoomId() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let s = "";
-  for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
-  return s;
-}
-function now() { return Date.now(); }
-function inBounds(r, c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
-function isDark(r, c) { return (r + c) % 2 === 1; }
-
-function createInitialBoard() {
-  const b = Array.from({ length: 8 }, () => Array(8).fill(null));
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 8; c++) if (isDark(r, c)) b[r][c] = "b";
+// socket auth
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token || "";
+    const payload = jwt.verify(token, JWT_SECRET);
+    socket.username = payload.u;
+    return next();
+  } catch {
+    return next(new Error("UNAUTHORIZED"));
   }
-  for (let r = 5; r < 8; r++) {
-    for (let c = 0; c < 8; c++) if (isDark(r, c)) b[r][c] = "w";
+});
+
+// ---- Game engine (Krievu dambrete) ----
+// piece codes: 'w','b' men ; 'W','B' kings
+function initialBoard() {
+  const b = Array.from({ length: 8 }, () => Array(8).fill(null));
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const dark = (r + c) % 2 === 1;
+      if (!dark) continue;
+      if (r < 3) b[r][c] = "b";
+      if (r > 4) b[r][c] = "w";
+    }
   }
   return b;
 }
-function pieceSide(p) { return p ? p.toLowerCase() : null; }
-function isKing(p) { return p === "W" || p === "B"; }
-function opponent(side) { return side === "w" ? "b" : "w"; }
 
 function cloneBoard(board) {
-  return board.map(row => row.slice());
+  return board.map((row) => row.slice());
+}
+function inBounds(r, c) {
+  return r >= 0 && r < 8 && c >= 0 && c < 8;
+}
+function isDark(r, c) {
+  return (r + c) % 2 === 1;
+}
+function colorOf(p) {
+  if (!p) return null;
+  return p === "w" || p === "W" ? "w" : "b";
+}
+function isKing(p) {
+  return p === "W" || p === "B";
+}
+function opponent(color) {
+  return color === "w" ? "b" : "w";
+}
+function promoteIfNeeded(piece, toR, color) {
+  if (isKing(piece)) return piece;
+  if (color === "w" && toR === 0) return "W";
+  if (color === "b" && toR === 7) return "B";
+  return piece;
 }
 
-function findAllMoves(board, side, mustFrom /* {r,c} or null */) {
-  const all = [];
-  const captures = [];
+const DIRS = [
+  [-1, -1],
+  [-1, 1],
+  [1, -1],
+  [1, 1],
+];
 
-  const sideChar = side; // 'w'/'b'
-  const opp = opponent(sideChar);
+// ---- Capture sequence generation (with immediate promotion) ----
+function genCapturesFrom(board, r, c, piece, capturedSet) {
+  const color = colorOf(piece);
+  const opp = opponent(color);
+  const results = [];
 
-  function addMove(list, mv) { list.push(mv); }
+  if (!isKing(piece)) {
+    // men capture in all diagonal directions in Russian checkers
+    for (const [dr, dc] of DIRS) {
+      const mr = r + dr,
+        mc = c + dc;
+      const lr = r + 2 * dr,
+        lc = c + 2 * dc;
+      if (!inBounds(lr, lc)) continue;
+      if (!isDark(lr, lc)) continue;
 
-  function genManMoves(r, c, p) {
-    const forward = sideChar === "w" ? -1 : 1;
-    // non-capture
-    for (const dc of [-1, +1]) {
-      const nr = r + forward, nc = c + dc;
-      if (inBounds(nr, nc) && isDark(nr, nc) && !board[nr][nc]) {
-        addMove(all, { from: { r, c }, to: { r: nr, c: nc }, captures: [] });
+      const mid = board[mr]?.[mc];
+      if (!mid) continue;
+      if (colorOf(mid) !== opp) continue;
+      const midKey = `${mr},${mc}`;
+      if (capturedSet.has(midKey)) continue;
+
+      if (board[lr][lc] !== null) continue;
+
+      const nb = cloneBoard(board);
+      nb[r][c] = null;
+      nb[mr][mc] = null;
+
+      let np = piece;
+      np = promoteIfNeeded(np, lr, color);
+      nb[lr][lc] = np;
+
+      const nCaptured = new Set(capturedSet);
+      nCaptured.add(midKey);
+
+      const tails = genCapturesFrom(nb, lr, lc, np, nCaptured);
+      if (tails.length === 0) results.push([[lr, lc]]);
+      else for (const t of tails) results.push([[lr, lc], ...t]);
+    }
+    return results;
+  }
+
+  // King capture: one opponent in line, land any empty beyond it
+  for (const [dr, dc] of DIRS) {
+    let rr = r + dr,
+      cc = c + dc;
+    let foundOpp = null;
+
+    while (inBounds(rr, cc) && isDark(rr, cc)) {
+      const cell = board[rr][cc];
+
+      if (cell === null) {
+        if (foundOpp) {
+          const [or, oc] = foundOpp;
+          const oppKey = `${or},${oc}`;
+          if (capturedSet.has(oppKey)) {
+            rr += dr;
+            cc += dc;
+            continue;
+          }
+
+          const nb = cloneBoard(board);
+          nb[r][c] = null;
+          nb[or][oc] = null;
+          nb[rr][cc] = piece;
+
+          const nCaptured = new Set(capturedSet);
+          nCaptured.add(oppKey);
+
+          const tails = genCapturesFrom(nb, rr, cc, piece, nCaptured);
+          if (tails.length === 0) results.push([[rr, cc]]);
+          else for (const t of tails) results.push([[rr, cc], ...t]);
+        }
+        rr += dr;
+        cc += dc;
+        continue;
+      }
+
+      if (colorOf(cell) === color) break;
+      if (colorOf(cell) === opp) {
+        if (foundOpp) break;
+        foundOpp = [rr, cc];
+        rr += dr;
+        cc += dc;
+        continue;
+      }
+
+      rr += dr;
+      cc += dc;
+    }
+  }
+
+  return results;
+}
+
+function allCapturePlans(board, color) {
+  const plans = new Map();
+  let maxCap = 0;
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = board[r][c];
+      if (!p) continue;
+      if (colorOf(p) !== color) continue;
+      const seqs = genCapturesFrom(board, r, c, p, new Set());
+      if (seqs.length > 0) {
+        for (const s of seqs) maxCap = Math.max(maxCap, s.length);
+        plans.set(`${r},${c}`, seqs);
       }
     }
-    // capture (all 4 dirs)
-    for (const dr of [-2, +2]) {
-      for (const dc of [-2, +2]) {
-        const nr = r + dr, nc = c + dc;
-        const mr = r + dr / 2, mc = c + dc / 2;
-        if (!inBounds(nr, nc) || !isDark(nr, nc)) continue;
-        if (board[nr][nc]) continue;
-        const mid = board[mr][mc];
-        if (mid && pieceSide(mid) === opp) {
-          addMove(captures, { from: { r, c }, to: { r: nr, c: nc }, captures: [{ r: mr, c: mc }] });
+  }
+
+  if (maxCap === 0) return { mustCapture: false, maxCap: 0, plans: new Map() };
+
+  const filtered = new Map();
+  for (const [from, seqs] of plans.entries()) {
+    const keep = seqs.filter((s) => s.length === maxCap);
+    if (keep.length) filtered.set(from, keep);
+  }
+  return { mustCapture: true, maxCap, plans: filtered };
+}
+
+function allQuietMoves(board, color) {
+  const moves = new Map();
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = board[r][c];
+      if (!p) continue;
+      if (colorOf(p) !== color) continue;
+
+      if (!isKing(p)) {
+        const dr = color === "w" ? -1 : 1;
+        for (const dc of [-1, 1]) {
+          const nr = r + dr,
+            nc = c + dc;
+          if (!inBounds(nr, nc)) continue;
+          if (!isDark(nr, nc)) continue;
+          if (board[nr][nc] !== null) continue;
+          const key = `${r},${c}`;
+          if (!moves.has(key)) moves.set(key, []);
+          moves.get(key).push([nr, nc]);
+        }
+      } else {
+        for (const [dr, dc] of DIRS) {
+          let nr = r + dr,
+            nc = c + dc;
+          while (inBounds(nr, nc) && isDark(nr, nc) && board[nr][nc] === null) {
+            const key = `${r},${c}`;
+            if (!moves.has(key)) moves.set(key, []);
+            moves.get(key).push([nr, nc]);
+            nr += dr;
+            nc += dc;
+          }
         }
       }
     }
   }
-
-  function genKingMoves(r, c, p) {
-    const dirs = [
-      [-1, -1], [-1, +1], [+1, -1], [+1, +1]
-    ];
-
-    // non-capture slides
-    for (const [dr, dc] of dirs) {
-      let nr = r + dr, nc = c + dc;
-      while (inBounds(nr, nc) && isDark(nr, nc) && !board[nr][nc]) {
-        addMove(all, { from: { r, c }, to: { r: nr, c: nc }, captures: [] });
-        nr += dr; nc += dc;
-      }
-    }
-
-    // capture (jump over exactly one enemy, land on any empty beyond)
-    for (const [dr, dc] of dirs) {
-      let nr = r + dr, nc = c + dc;
-      // skip empty
-      while (inBounds(nr, nc) && isDark(nr, nc) && !board[nr][nc]) { nr += dr; nc += dc; }
-      if (!inBounds(nr, nc) || !isDark(nr, nc)) continue;
-      const hit = board[nr][nc];
-      if (!hit || pieceSide(hit) !== opp) continue;
-
-      const hitPos = { r: nr, c: nc };
-      // squares after hit must be empty for landing
-      nr += dr; nc += dc;
-      while (inBounds(nr, nc) && isDark(nr, nc) && !board[nr][nc]) {
-        addMove(captures, { from: { r, c }, to: { r: nr, c: nc }, captures: [hitPos] });
-        nr += dr; nc += dc;
-      }
-    }
-  }
-
-  for (let r = 0; r < 8; r++) {
-    for (let c = 0; c < 8; c++) {
-      if (!isDark(r, c)) continue;
-      const p = board[r][c];
-      if (!p) continue;
-      if (pieceSide(p) !== sideChar) continue;
-      if (mustFrom && (mustFrom.r !== r || mustFrom.c !== c)) continue;
-
-      if (isKing(p)) genKingMoves(r, c, p);
-      else genManMoves(r, c, p);
-    }
-  }
-
-  // mandatory capture rule
-  if (captures.length > 0) return { moves: captures, mustCapture: true };
-  return { moves: all, mustCapture: false };
+  return moves;
 }
 
-function applyMove(room, mv) {
-  const b = cloneBoard(room.board);
-  const p = b[mv.from.r][mv.from.c];
-  b[mv.from.r][mv.from.c] = null;
-  b[mv.to.r][mv.to.c] = p;
+function findCapturedSquare(board, fr, fc, tr, tc) {
+  const dr = Math.sign(tr - fr);
+  const dc = Math.sign(tc - fc);
+  let r = fr + dr,
+    c = fc + dc;
+  let found = null;
 
-  // remove captures
-  for (const cap of mv.captures) b[cap.r][cap.c] = null;
-
-  // promotion (immediate)
-  let placed = b[mv.to.r][mv.to.c];
-  if (placed && !isKing(placed)) {
-    if (placed === "w" && mv.to.r === 0) placed = "W";
-    if (placed === "b" && mv.to.r === 7) placed = "B";
-    b[mv.to.r][mv.to.c] = placed;
-  }
-
-  room.board = b;
-
-  // check chain capture continuation
-  const side = room.turn;
-  const cont = findAllMoves(room.board, side, { r: mv.to.r, c: mv.to.c });
-  const canContinue = cont.mustCapture && cont.moves.length > 0;
-
-  if (mv.captures.length > 0 && canContinue) {
-    room.mustContinue = { r: mv.to.r, c: mv.to.c };
-  } else {
-    room.mustContinue = null;
-    room.turn = opponent(room.turn);
-  }
-
-  room.lastMove = mv;
-  room.updatedAt = now();
-}
-
-function countPieces(board, side) {
-  let n = 0;
-  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
+  while (r !== tr && c !== tc) {
     const p = board[r][c];
-    if (p && pieceSide(p) === side) n++;
+    if (p !== null) {
+      if (found) return null;
+      found = [r, c];
+    }
+    r += dr;
+    c += dc;
   }
-  return n;
+  return found;
 }
 
-function gameState(room) {
-  const legal = findAllMoves(room.board, room.turn, room.mustContinue);
-  const map = {};
-  for (const mv of legal.moves) {
-    const k = `${mv.from.r},${mv.from.c}`;
-    if (!map[k]) map[k] = [];
-    map[k].push({ r: mv.to.r, c: mv.to.c, captures: mv.captures });
-  }
+function hasAnyMove(board, color) {
+  const caps = allCapturePlans(board, color);
+  if (caps.mustCapture) return caps.plans.size > 0;
+  const quiet = allQuietMoves(board, color);
+  return quiet.size > 0;
+}
 
+// ---- Rooms & state ----
+const rooms = new Map(); // roomId -> roomState
+
+function makeRoomId() {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function publicRoomInfo(room) {
   return {
     id: room.id,
+    white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl || "" } : null,
+    black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl || "" } : null,
+    spectators: room.spectators.size,
     status: room.status,
-    turn: room.turn, // 'w' or 'b'
-    mustContinue: room.mustContinue,
-    mustCapture: legal.mustCapture,
+  };
+}
+
+async function getUserPublic(username) {
+  const users = await readUsers();
+  const u = users[username.toLowerCase()];
+  return u ? safeUserPublic(u) : null;
+}
+
+function rnd(min, max) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+function makeBotSeat(roomId, color) {
+  return { username: `BOT_${roomId}_${color.toUpperCase()}`, avatarUrl: "", isBot: true };
+}
+function seatIsBot(seat) {
+  return !!seat?.isBot || (typeof seat?.username === "string" && seat.username.startsWith("BOT_"));
+}
+function botColor(room) {
+  if (seatIsBot(room.white)) return "w";
+  if (seatIsBot(room.black)) return "b";
+  return null;
+}
+function botUsername(room) {
+  if (seatIsBot(room.white)) return room.white.username;
+  if (seatIsBot(room.black)) return room.black.username;
+  return null;
+}
+function otherHumanUsername(room, color) {
+  if (color === "w") return room.black?.username && !seatIsBot(room.black) ? room.black.username : null;
+  return room.white?.username && !seatIsBot(room.white) ? room.white.username : null;
+}
+
+function roomStatePayload(room) {
+  return {
+    id: room.id,
     board: room.board,
-    white: room.white || null,
-    black: room.black || null,
-    bot: room.bot || false,
-    legalByFrom: map
+    turn: room.turn,
+    status: room.status,
+    lastMove: room.lastMove || null,
+    white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl || "" } : null,
+    black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl || "" } : null,
+    winner: room.winner || null,
+    reason: room.reason || null,
   };
 }
 
-function serializeRooms() {
-  const list = [];
-  for (const r of rooms.values()) {
-    // cleanup info
-    const spectators = r.spectators?.size || 0;
-    list.push({
-      id: r.id,
-      status: r.status,
-      bot: !!r.bot,
-      spectators,
-      white: r.white ? publicUser(r.white) : null,
-      black: r.black ? publicUser(r.black) : null
-    });
+function emitRoomList() {
+  const list = Array.from(rooms.values()).map(publicRoomInfo);
+  io.to("lobby").emit("room:list", list);
+}
+
+function emitOnlineCount() {
+  io.emit("online:count", io.engine.clientsCount);
+}
+
+function findSocketIdByUsername(username) {
+  if (!username) return null;
+  for (const [id, s] of io.of("/").sockets) {
+    if (s.username === username) return id;
   }
-  // newest first
-  list.sort((a, b) => (b.id > a.id ? 1 : -1));
-  return list;
+  return null;
 }
 
-function broadcastLobby() {
-  io.emit("room:list", serializeRooms());
-  const db = readDB();
-  const top10 = [...db.users]
-    .sort((a, b) => (b.stats?.rating ?? 1000) - (a.stats?.rating ?? 1000))
-    .slice(0, 10)
-    .map(u => ({
-      username: u.username,
-      avatarUrl: u.avatarUrl || "",
-      rating: u.stats?.rating ?? 1000,
-      xp: u.stats?.xp ?? 0,
-      wins: u.stats?.wins ?? 0
-    }));
-  io.emit("leaderboard:top10", top10);
-}
-
-function getUserFromDB(username) {
-  const db = readDB();
-  return db.users.find(u => u.username === username) || null;
-}
-
-function updateStats(winnerName, loserName) {
-  const db = readDB();
-  const w = db.users.find(u => u.username === winnerName);
-  const l = db.users.find(u => u.username === loserName);
-  if (w) {
-    w.stats.wins = (w.stats.wins || 0) + 1;
-    w.stats.xp = (w.stats.xp || 0) + 20;
-    w.stats.rating = (w.stats.rating || 1000) + 15;
+// ===== Turn move packaging =====
+function buildYourMoves(room, color) {
+  // pending chain: only that piece can move
+  if (room.pending && room.pending.color === color) {
+    const key = `${room.pending.cur[0]},${room.pending.cur[1]}`;
+    const nextTo = new Set();
+    for (const seq of room.pending.remainingSeqs) {
+      const nxt = seq[room.pending.stepIndex];
+      if (nxt) nextTo.add(`${nxt[0]},${nxt[1]}`);
+    }
+    const tos = Array.from(nextTo).map((s) => s.split(",").map((n) => parseInt(n, 10)));
+    return { pending: true, mustCapture: true, selectable: [room.pending.cur], moves: { [key]: tos } };
   }
-  if (l) {
-    l.stats.losses = (l.stats.losses || 0) + 1;
-    l.stats.xp = (l.stats.xp || 0) + 5;
-    l.stats.rating = Math.max(0, (l.stats.rating || 1000) - 15);
+
+  const cap = allCapturePlans(room.board, color);
+  if (cap.mustCapture) {
+    const selectable = [];
+    const moves = {};
+    for (const [from, seqs] of cap.plans.entries()) {
+      const [fr, fc] = from.split(",").map((n) => parseInt(n, 10));
+      selectable.push([fr, fc]);
+      const set = new Set();
+      for (const seq of seqs) set.add(`${seq[0][0]},${seq[0][1]}`);
+      moves[from] = Array.from(set).map((s) => s.split(",").map((n) => parseInt(n, 10)));
+    }
+    room.turnPlan = { color, capPlans: cap.plans, maxCap: cap.maxCap };
+    return { pending: false, mustCapture: true, selectable, moves };
   }
-  writeDB(db);
+
+  const quiet = allQuietMoves(room.board, color);
+  const selectable = [];
+  const moves = {};
+  for (const [from, tos] of quiet.entries()) {
+    const [fr, fc] = from.split(",").map((n) => parseInt(n, 10));
+    selectable.push([fr, fc]);
+    moves[from] = tos;
+  }
+  room.turnPlan = { color, capPlans: new Map(), maxCap: 0 };
+  return { pending: false, mustCapture: false, selectable, moves };
 }
 
-function ensureRoom(id, bot = false) {
-  if (rooms.has(id)) return rooms.get(id);
-  const room = {
-    id,
-    status: "waiting",
-    board: createInitialBoard(),
-    turn: "w",
-    mustContinue: null,
-    white: null,
-    black: null,
-    bot: !!bot,
-    spectators: new Set(),
-    createdAt: now(),
-    updatedAt: now(),
-    emptySince: null,
-    lastMove: null,
-    botThinking: false
-  };
-  rooms.set(id, room);
-  return room;
+async function updateStatsOnResult(winnerUsername, loserUsername) {
+  // BOT spēles leaderboardā NEskaitām
+  if (!winnerUsername || !loserUsername) return;
+  if (winnerUsername.startsWith("BOT_") || loserUsername.startsWith("BOT_")) return;
+
+  const users = await readUsers();
+  const wKey = winnerUsername.toLowerCase();
+  const lKey = loserUsername.toLowerCase();
+  if (!users[wKey] || !users[lKey]) return;
+
+  users[wKey].stats.wins += 1;
+  users[wKey].stats.xp += 25;
+  users[wKey].stats.rating += 10;
+
+  users[lKey].stats.losses += 1;
+  users[lKey].stats.xp += 5;
+  users[lKey].stats.rating = Math.max(800, (users[lKey].stats.rating || 1000) - 8);
+
+  await atomicWriteJSON(USERS_FILE, users);
+  io.emit("leaderboard:top10", computeTop10(users));
 }
 
-function scheduleCleanup() {
-  const t = now();
-  for (const [id, r] of rooms) {
-    const hasPlayers = !!r.white || !!r.black;
-    if (!hasPlayers) {
-      if (!r.emptySince) r.emptySince = t;
-      // keep empty rooms 10 minutes
-      if (t - r.emptySince > 10 * 60 * 1000) rooms.delete(id);
+function scheduleBotIfWaiting(room) {
+  if (!room || room.status !== "waiting") return;
+  if (room.botTimer) return;
+
+  const wHuman = room.white && !seatIsBot(room.white);
+  const bHuman = room.black && !seatIsBot(room.black);
+
+  const hasExactlyOneHuman = (wHuman && !room.black) || (bHuman && !room.white);
+  if (!hasExactlyOneHuman) return;
+
+  room.botTimer = setTimeout(() => {
+    room.botTimer = null;
+
+    const current = rooms.get(room.id);
+    if (!current || current.status !== "waiting") return;
+
+    // ja pa to laiku ienāca cilvēks -> neko nedaram
+    if (current.white && current.black) return;
+
+    const wH = current.white && !seatIsBot(current.white);
+    const bH = current.black && !seatIsBot(current.black);
+
+    if (wH && !current.black) current.black = makeBotSeat(current.id, "b");
+    else if (bH && !current.white) current.white = makeBotSeat(current.id, "w");
+    else return;
+
+    current.status = "playing";
+    current.winner = null;
+    current.reason = null;
+    current.pending = null;
+    current.turnPlan = null;
+    current.turn = "w";
+    current.lastMove = null;
+
+    io.to(current.id).emit("game:state", roomStatePayload(current));
+    emitRoomList();
+
+    sendTurnMoves(current);
+  }, BOT_JOIN_WAIT_MS);
+}
+
+function clearBotTimers(room) {
+  if (!room) return;
+  if (room.botTimer) {
+    clearTimeout(room.botTimer);
+    room.botTimer = null;
+  }
+  if (room.botThinkTimer) {
+    clearTimeout(room.botThinkTimer);
+    room.botThinkTimer = null;
+  }
+}
+
+function finishGame(room, winnerUsername, reason) {
+  room.status = "finished";
+  room.winner = winnerUsername || null;
+  room.reason = reason || "END";
+  room.pending = null;
+  room.turnPlan = null;
+
+  io.to(room.id).emit("game:state", roomStatePayload(room));
+  emitRoomList();
+}
+
+function sendTurnMoves(room) {
+  if (!room || room.status !== "playing") return;
+
+  const turnColor = room.turn;
+  const currentSeat = turnColor === "w" ? room.white : room.black;
+  const currentUsername = currentSeat?.username;
+
+  // BOT gājiens
+  if (seatIsBot(currentSeat)) {
+    const otherUser = otherHumanUsername(room, turnColor);
+    const otherSock = findSocketIdByUsername(otherUser);
+    if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
+    scheduleBotMove(room);
+    return;
+  }
+
+  // cilvēka gājiens
+  const sId = findSocketIdByUsername(currentUsername);
+  if (sId) io.to(sId).emit("game:yourMoves", buildYourMoves(room, turnColor));
+
+  // otram cilvēkam (ja ir) notīra
+  const otherUser = otherHumanUsername(room, turnColor);
+  const otherSock = findSocketIdByUsername(otherUser);
+  if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
+}
+
+function pickBotMove(legal) {
+  if (!legal || !legal.moves || !legal.selectable || legal.selectable.length === 0) return null;
+  const from = legal.selectable[rnd(0, legal.selectable.length - 1)];
+  const key = `${from[0]},${from[1]}`;
+  const tos = legal.moves[key] || [];
+  if (!tos.length) return null;
+  const to = tos[rnd(0, tos.length - 1)];
+  return { from, to };
+}
+
+function applyMoveCore(room, myColor, from, to, byUsername) {
+  const [fr, fc] = from;
+  const [tr, tc] = to;
+
+  if (!inBounds(fr, fc) || !inBounds(tr, tc)) return { ok: false };
+  if (!isDark(fr, fc) || !isDark(tr, tc)) return { ok: false };
+  if (room.board[tr][tc] !== null) return { ok: false };
+
+  const piece = room.board[fr][fc];
+  if (!piece || colorOf(piece) !== myColor) return { ok: false };
+
+  // server-authoritative legal check
+  const legal = buildYourMoves(room, myColor);
+  const key = `${fr},${fc}`;
+  const allowedTos = legal?.moves?.[key] || null;
+  if (!allowedTos) return { ok: false };
+  const okTo = allowedTos.some(([r, c]) => r === tr && c === tc);
+  if (!okTo) return { ok: false };
+
+  // diagonal only
+  const dr = tr - fr;
+  const dc = tc - fc;
+  if (Math.abs(dr) !== Math.abs(dc)) return { ok: false };
+
+  // capture detection
+  let didCapture = false;
+  let captured = findCapturedSquare(room.board, fr, fc, tr, tc);
+  if (captured) {
+    const [cr, cc] = captured;
+    const capPiece = room.board[cr][cc];
+    if (!capPiece) return { ok: false };
+    if (colorOf(capPiece) !== opponent(myColor)) return { ok: false };
+    didCapture = true;
+  }
+
+  // apply
+  room.board[fr][fc] = null;
+  if (didCapture) {
+    const [cr, cc] = captured;
+    room.board[cr][cc] = null;
+  }
+
+  let newPiece = promoteIfNeeded(piece, tr, myColor);
+  room.board[tr][tc] = newPiece;
+
+  room.lastMove = { by: byUsername, from: [fr, fc], to: [tr, tc], capture: didCapture };
+
+  // manage pending max-capture chain
+  if (didCapture) {
+    if (!room.pending) {
+      const plan = room.turnPlan;
+      const seqs = plan?.capPlans?.get(`${fr},${fc}`) || [];
+      const matching = seqs.filter((s) => s[0][0] === tr && s[0][1] === tc);
+      room.pending = { color: myColor, cur: [tr, tc], stepIndex: 1, remainingSeqs: matching };
     } else {
-      r.emptySince = null;
+      const rem = room.pending.remainingSeqs;
+      const idx = room.pending.stepIndex;
+      const matching = rem.filter((s) => s[idx] && s[idx][0] === tr && s[idx][1] === tc);
+      room.pending.cur = [tr, tc];
+      room.pending.stepIndex += 1;
+      room.pending.remainingSeqs = matching;
     }
+
+    const stillHasNext = room.pending.remainingSeqs.some((s) => s[room.pending.stepIndex] != null);
+    if (stillHasNext) return { ok: true, continued: true };
+
+    room.pending = null;
   }
+
+  // turn switch
+  room.turn = opponent(room.turn);
+  room.turnPlan = null;
+
+  const oppColor = room.turn;
+  const oppHas = hasAnyMove(room.board, oppColor);
+  if (!oppHas) {
+    const winner = myColor === "w" ? room.white?.username : room.black?.username;
+    return { ok: true, finished: true, winner, reason: "NO_MOVES" };
+  }
+
+  return { ok: true, continued: false, finished: false };
 }
-setInterval(scheduleCleanup, 30 * 1000);
 
-async function botMaybeMove(room) {
-  if (!room.bot) return;
-  const botSide = "b"; // bot is always black in this version
-  if (room.turn !== botSide) return;
-  if (room.status !== "playing") return;
-  if (room.botThinking) return;
+function scheduleBotMove(room) {
+  if (!room || room.status !== "playing") return;
 
-  room.botThinking = true;
-  setTimeout(() => {
-    try {
-      const legal = findAllMoves(room.board, botSide, room.mustContinue);
-      if (!legal.moves.length) {
-        // bot has no moves -> white wins
-        endGame(room, "w");
-        return;
+  const bc = botColor(room);
+  if (!bc) return;
+  if (room.turn !== bc) return;
+  if (room.botThinkTimer) return;
+
+  room.botThinkTimer = setTimeout(async () => {
+    room.botThinkTimer = null;
+
+    const current = rooms.get(room.id);
+    if (!current || current.status !== "playing") return;
+
+    const botC = botColor(current);
+    if (!botC || current.turn !== botC) return;
+
+    const legal = buildYourMoves(current, botC);
+    const pick = pickBotMove(legal);
+
+    if (!pick) {
+      const human = otherHumanUsername(current, botC);
+      finishGame(current, human, "BOT_NO_MOVES");
+      return;
+    }
+
+    const res = applyMoveCore(current, botC, pick.from, pick.to, botUsername(current) || "BOT");
+    io.to(current.id).emit("game:state", roomStatePayload(current));
+
+    if (!res.ok) {
+      scheduleBotMove(current);
+      return;
+    }
+
+    if (res.finished) {
+      finishGame(current, res.winner, res.reason);
+      if (res.winner) {
+        const loser = otherHumanUsername(current, botC);
+        await updateStatsOnResult(res.winner, loser);
       }
-      const mv = legal.moves[Math.floor(Math.random() * legal.moves.length)];
-      applyMove(room, mv);
-      checkEnd(room);
-      io.to(room.id).emit("game:state", gameState(room));
-      broadcastLobby();
-    } finally {
-      room.botThinking = false;
+      return;
     }
-  }, 400);
+
+    if (res.continued) {
+      scheduleBotMove(current);
+      return;
+    }
+
+    sendTurnMoves(current);
+  }, rnd(BOT_THINK_MIN_MS, BOT_THINK_MAX_MS));
 }
 
-function endGame(room, winnerSide) {
-  room.status = "ended";
-  const wUser = room.white?.username;
-  const bUser = room.black?.username;
+// ---- Socket events ----
+io.on("connection", async (socket) => {
+  const me = socket.username;
 
-  if (winnerSide === "w" && wUser && bUser && bUser !== "BOT") updateStats(wUser, bUser);
-  if (winnerSide === "b" && wUser && bUser && bUser !== "BOT") updateStats(bUser, wUser);
+  socket.join("lobby");
+  emitOnlineCount();
 
-  io.to(room.id).emit("game:ended", { winner: winnerSide });
-  io.to(room.id).emit("game:state", gameState(room));
-  broadcastLobby();
-}
+  const users = await readUsers();
+  socket.emit("leaderboard:top10", computeTop10(users));
+  emitRoomList();
 
-function checkEnd(room) {
-  const wCount = countPieces(room.board, "w");
-  const bCount = countPieces(room.board, "b");
-  if (wCount === 0) return endGame(room, "b");
-  if (bCount === 0) return endGame(room, "w");
-
-  const legal = findAllMoves(room.board, room.turn, room.mustContinue);
-  if (!legal.moves.length) {
-    // current player stuck => other wins
-    endGame(room, opponent(room.turn));
-  }
-}
-
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  if (!token) return next(new Error("NO_TOKEN"));
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const user = getUserFromDB(payload.username);
-    if (!user) return next(new Error("NO_USER"));
-    socket.user = user;
-    next();
-  } catch {
-    next(new Error("BAD_TOKEN"));
-  }
-});
-
-io.on("connection", (socket) => {
-  onlineCount++;
-  io.emit("online:count", onlineCount);
-
-  socket.emit("me", publicUser(socket.user));
-
-  socket.on("lobby:hello", () => {
-    socket.emit("online:count", onlineCount);
-    socket.emit("room:list", serializeRooms());
-    const db = readDB();
-    const top10 = [...db.users]
-      .sort((a, b) => (b.stats?.rating ?? 1000) - (a.stats?.rating ?? 1000))
-      .slice(0, 10)
-      .map(u => ({
-        username: u.username,
-        avatarUrl: u.avatarUrl || "",
-        rating: u.stats?.rating ?? 1000,
-        xp: u.stats?.xp ?? 0,
-        wins: u.stats?.wins ?? 0
-      }));
-    socket.emit("leaderboard:top10", top10);
+  socket.on("lobby:hello", async () => {
+    const u = await getUserPublic(me);
+    socket.emit("me", u);
+    emitRoomList();
+    emitOnlineCount();
   });
 
-  // Create room (optionally with id & bot)
-  socket.on("room:create", (payload = {}, cb) => {
-    let id = String(payload.id || "").trim().toUpperCase();
-    const bot = !!payload.bot;
+  // room:create (optional vsBot flag)
+  socket.on("room:create", async ({ vsBot } = {}) => {
+    const id = makeRoomId();
+    const u = await getUserPublic(me);
+    if (!u) return;
 
-    if (id) {
-      if (!/^[A-Z0-9]{6}$/.test(id)) {
-        cb?.({ ok: false, error: "BAD_ROOM_ID" });
-        return socket.emit("room:error", { error: "BAD_ROOM_ID" });
-      }
-      if (rooms.has(id)) {
-        cb?.({ ok: false, error: "ROOM_EXISTS" });
-        return socket.emit("room:error", { error: "ROOM_EXISTS" });
-      }
+    const room = {
+      id,
+      board: initialBoard(),
+      turn: "w",
+      status: "waiting",
+      white: { username: u.username, avatarUrl: u.avatarUrl },
+      black: null,
+      spectators: new Set(),
+      pending: null,
+      turnPlan: null,
+      winner: null,
+      reason: null,
+      lastMove: null,
+      botTimer: null,
+      botThinkTimer: null,
+    };
+
+    if (vsBot) {
+      room.black = makeBotSeat(room.id, "b");
+      room.status = "playing";
+      clearBotTimers(room);
     } else {
-      do { id = genRoomId(); } while (rooms.has(id));
+      scheduleBotIfWaiting(room);
     }
 
-    ensureRoom(id, bot);
-    cb?.({ ok: true, id });
+    rooms.set(id, room);
+    emitRoomList();
     socket.emit("room:created", { id });
-    broadcastLobby();
   });
 
-  // Join room (game page)
-  socket.on("room:join", ({ id } = {}, cb) => {
-    const roomId = String(id || "").trim().toUpperCase();
-    if (!/^[A-Z0-9]{6}$/.test(roomId)) {
-      cb?.({ ok: false, error: "BAD_ROOM_ID" });
-      return socket.emit("room:error", { error: "BAD_ROOM_ID" });
+  // ======= ROOM JOIN (FIX: allowCreateIfMissing) =======
+  socket.on("room:join", async ({ id, allowCreateIfMissing } = {}) => {
+    id = String(id || "").toUpperCase().trim();
+    const u = await getUserPublic(me);
+    if (!u) return socket.emit("room:error", { error: "UNAUTHORIZED" });
+    if (!/^[A-Z0-9]{6}$/.test(id)) return socket.emit("room:error", { error: "BAD_ROOM_CODE" });
+
+    let room = rooms.get(id);
+
+    // FIX: ja room nav atrasts, bet klients atļauj -> izveidojam jaunu room ar šo kodu
+    if (!room && allowCreateIfMissing) {
+      room = {
+        id,
+        board: initialBoard(),
+        turn: "w",
+        status: "waiting",
+        white: { username: u.username, avatarUrl: u.avatarUrl },
+        black: null,
+        spectators: new Set(),
+        pending: null,
+        turnPlan: null,
+        winner: null,
+        reason: null,
+        lastMove: null,
+        botTimer: null,
+        botThinkTimer: null,
+      };
+      rooms.set(id, room);
+      scheduleBotIfWaiting(room);
+      emitRoomList();
     }
 
-    const room = rooms.get(roomId);
-    if (!room) {
-      cb?.({ ok: false, error: "ROOM_NOT_FOUND" });
-      return socket.emit("room:error", { error: "ROOM_NOT_FOUND" });
+    if (!room) return socket.emit("room:error", { error: "ROOM_NOT_FOUND" });
+
+    socket.leave("lobby");
+    socket.join(id);
+
+    // ja ienāk cilvēks, atceļam bot wait timer
+    if (room.botTimer) {
+      clearTimeout(room.botTimer);
+      room.botTimer = null;
     }
 
-    socket.join(roomId);
+    let role = "spectator";
 
-    // assign seat or spectator (allow rejoin)
-    const u = socket.user;
-
-    const isWhite = room.white?.username === u.username;
-    const isBlack = room.black?.username === u.username;
-
-    if (!room.white && !room.black && room.bot) {
-      // bot room: first human is white, bot is black
-      room.white = u;
-      room.black = { username: "BOT", avatarUrl: "", stats: { rating: 0, xp: 0, wins: 0, losses: 0 } };
-      room.status = "playing";
-    } else if (isWhite) {
-      room.white = u;
-    } else if (isBlack) {
-      room.black = u;
-    } else if (!room.white) {
-      room.white = u;
-    } else if (!room.black && room.white.username !== u.username) {
-      room.black = u;
-      room.status = "playing";
+    if (!room.white || room.white.username === u.username) {
+      room.white = { username: u.username, avatarUrl: u.avatarUrl };
+      role = "white";
+    } else if (!room.black || room.black.username === u.username) {
+      room.black = { username: u.username, avatarUrl: u.avatarUrl };
+      role = "black";
     } else {
-      room.spectators.add(socket.id);
+      room.spectators.add(u.username);
     }
 
-    room.updatedAt = now();
-
-    cb?.({ ok: true });
-    socket.emit("room:joined", { roomId });
-    io.to(roomId).emit("game:state", gameState(room));
-    broadcastLobby();
-
-    botMaybeMove(room);
-  });
-
-  socket.on("game:move", ({ roomId, from, to } = {}) => {
-    const id = String(roomId || "").trim().toUpperCase();
-    const room = rooms.get(id);
-    if (!room) return socket.emit("game:error", { error: "ROOM_NOT_FOUND" });
-    if (room.status !== "playing") return socket.emit("game:error", { error: "NOT_PLAYING" });
-
-    const side =
-      room.white?.username === socket.user.username ? "w" :
-      room.black?.username === socket.user.username ? "b" :
-      null;
-
-    if (!side) return socket.emit("game:error", { error: "SPECTATOR" });
-    if (room.turn !== side) return socket.emit("game:error", { error: "NOT_YOUR_TURN" });
-
-    const fr = { r: Number(from?.r), c: Number(from?.c) };
-    const tt = { r: Number(to?.r), c: Number(to?.c) };
-    if (!inBounds(fr.r, fr.c) || !inBounds(tt.r, tt.c)) return socket.emit("game:error", { error: "BAD_MOVE" });
-
-    if (room.mustContinue && (room.mustContinue.r !== fr.r || room.mustContinue.c !== fr.c)) {
-      return socket.emit("game:error", { error: "MUST_CONTINUE_CAPTURE" });
+    // start if both present
+    if (room.white && room.black) {
+      room.status = "playing";
+      room.winner = null;
+      room.reason = null;
+      room.pending = null;
+      room.turnPlan = null;
+      room.turn = "w";
+      room.lastMove = null;
+      clearBotTimers(room);
+    } else {
+      room.status = "waiting";
+      room.pending = null;
+      room.turnPlan = null;
+      scheduleBotIfWaiting(room);
     }
 
-    const legal = findAllMoves(room.board, side, room.mustContinue);
-    const mv = legal.moves.find(m =>
-      m.from.r === fr.r && m.from.c === fr.c && m.to.r === tt.r && m.to.c === tt.c
-    );
-    if (!mv) return socket.emit("game:error", { error: "ILLEGAL_MOVE" });
+    io.to(id).emit("game:state", roomStatePayload(room));
+    emitRoomList();
 
-    applyMove(room, mv);
-    checkEnd(room);
-    io.to(id).emit("game:state", gameState(room));
-    broadcastLobby();
+    socket.emit("room:joined", { id, role });
 
-    botMaybeMove(room);
+    if (room.status === "playing") sendTurnMoves(room);
+    else socket.emit("game:yourMoves", null);
   });
 
-  socket.on("game:resign", ({ roomId } = {}) => {
-    const id = String(roomId || "").trim().toUpperCase();
+  socket.on("game:move", async ({ id, from, to }) => {
+    id = String(id || "").toUpperCase().trim();
     const room = rooms.get(id);
-    if (!room) return;
+    if (!room || room.status !== "playing") return;
 
-    const side =
-      room.white?.username === socket.user.username ? "w" :
-      room.black?.username === socket.user.username ? "b" :
-      null;
-    if (!side) return;
+    const u = await getUserPublic(me);
+    if (!u) return;
 
-    endGame(room, opponent(side));
+    const myColor =
+      room.white?.username === u.username ? "w" : room.black?.username === u.username ? "b" : null;
+    if (!myColor) return;
+    if (room.turn !== myColor) return;
+
+    const [fr, fc] = from || [];
+    const [tr, tc] = to || [];
+    if (![fr, fc, tr, tc].every((n) => Number.isInteger(n))) return;
+
+    const res = applyMoveCore(room, myColor, [fr, fc], [tr, tc], u.username);
+    io.to(id).emit("game:state", roomStatePayload(room));
+    if (!res.ok) return;
+
+    if (res.finished) {
+      finishGame(room, res.winner, res.reason);
+      const loser = myColor === "w" ? room.black?.username : room.white?.username;
+      if (res.winner && loser) await updateStatsOnResult(res.winner, loser);
+      return;
+    }
+
+    if (res.continued) {
+      const sId = findSocketIdByUsername(u.username);
+      if (sId) io.to(sId).emit("game:yourMoves", buildYourMoves(room, myColor));
+      return;
+    }
+
+    sendTurnMoves(room);
+  });
+
+  socket.on("game:resign", async ({ id }) => {
+    id = String(id || "").toUpperCase().trim();
+    const room = rooms.get(id);
+    if (!room || room.status !== "playing") return;
+
+    const u = await getUserPublic(me);
+    if (!u) return;
+
+    const myColor =
+      room.white?.username === u.username ? "w" : room.black?.username === u.username ? "b" : null;
+    if (!myColor) return;
+
+    const winner = myColor === "w" ? room.black?.username : room.white?.username;
+    finishGame(room, winner, "RESIGN");
+
+    const loser = u.username;
+    if (winner && loser) await updateStatsOnResult(winner, loser);
   });
 
   socket.on("disconnect", () => {
-    onlineCount = Math.max(0, onlineCount - 1);
-    io.emit("online:count", onlineCount);
+    emitOnlineCount();
 
-    // remove spectator socket ids
-    for (const r of rooms.values()) r.spectators.delete(socket.id);
+    for (const room of rooms.values()) {
+      const wasInSeat = room.white?.username === me || room.black?.username === me;
 
-    broadcastLobby();
+      if (room.white?.username === me) room.white = null;
+      if (room.black?.username === me) room.black = null;
+      room.spectators.delete(me);
+
+      if (wasInSeat) {
+        if (room.status === "playing") {
+          room.status = "waiting";
+          room.winner = null;
+          room.reason = null;
+          room.pending = null;
+          room.turnPlan = null;
+          clearBotTimers(room);
+        }
+        scheduleBotIfWaiting(room);
+        io.to(room.id).emit("game:state", roomStatePayload(room));
+      }
+
+      const hasHuman =
+        (room.white && !seatIsBot(room.white)) ||
+        (room.black && !seatIsBot(room.black)) ||
+        (room.spectators && room.spectators.size > 0);
+
+      if (!hasHuman) {
+        clearBotTimers(room);
+        rooms.delete(room.id);
+      }
+    }
+
+    emitRoomList();
   });
 });
 
 server.listen(PORT, () => {
-  console.log("Dambretes server listening on", PORT);
+  console.log("Bugats Dambretes server running on port", PORT);
+  console.log("Allowed origins:", ALLOWED_ORIGINS);
+  console.log("BOT_JOIN_WAIT_MS:", BOT_JOIN_WAIT_MS);
 });
