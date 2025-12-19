@@ -1,14 +1,9 @@
 {
-  "name": "bugats-dambretes-server",
+  "name": "bugats-dambrete-server",
   "version": "1.0.0",
-  "description": "Bugats Dambretes server (auth, avatars, rooms, bot, russian checkers rules)",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
