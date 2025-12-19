@@ -11,19 +11,18 @@ const { Server } = require("socket.io");
 
 const PORT = process.env.PORT || 10080;
 const JWT_SECRET = process.env.JWT_SECRET || "BUGATS_DAMBRETE_SECRET_CHANGE_ME";
-
-// Ieteikums: Render ENV ieliec:
-// ALLOWED_ORIGINS=https://thezone.lv,https://www.thezone.lv,http://localhost:5500,http://127.0.0.1:5500
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  "https://thezone.lv,https://www.thezone.lv,http://localhost:5500,http://127.0.0.1:5500")
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "https://thezone.lv,http://localhost:5500,http://127.0.0.1:5500")
   .split(",")
-  .map((s) => s.trim())
+  .map(s => s.trim())
   .filter(Boolean);
 
 // ===== BOT konfigurācija =====
 const BOT_JOIN_WAIT_MS = parseInt(process.env.BOT_JOIN_WAIT_MS || "10000", 10); // 10s
 const BOT_THINK_MIN_MS = parseInt(process.env.BOT_THINK_MIN_MS || "450", 10);
 const BOT_THINK_MAX_MS = parseInt(process.env.BOT_THINK_MAX_MS || "900", 10);
+
+// ===== Ranked forfeit (disconnect) =====
+const FORFEIT_GRACE_MS = parseInt(process.env.FORFEIT_GRACE_MS || "30000", 10); // 30s
 
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
@@ -38,7 +37,6 @@ function ensureDir(p) {
 ensureDir(DATA_DIR);
 ensureDir(UPLOADS_DIR);
 ensureDir(AVATARS_DIR);
-ensureDir(PUBLIC_DIR);
 if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "{}", "utf8");
 
 // ---- atomic JSON write queue ----
@@ -66,20 +64,20 @@ function safeUserPublic(u) {
   return {
     username: u.username,
     avatarUrl: u.avatarUrl || "",
-    stats: u.stats || { wins: 0, losses: 0, draws: 0, xp: 0, rating: 1000 },
+    stats: u.stats || { wins: 0, losses: 0, draws: 0, xp: 0, rating: 1000 }
   };
 }
 
 function computeTop10(users) {
-  const arr = Object.values(users).map((u) => ({
+  const arr = Object.values(users).map(u => ({
     username: u.username,
     avatarUrl: u.avatarUrl || "",
     wins: u.stats?.wins || 0,
     losses: u.stats?.losses || 0,
     xp: u.stats?.xp || 0,
-    rating: u.stats?.rating ?? 1000,
+    rating: u.stats?.rating ?? 1000
   }));
-  arr.sort((a, b) => b.rating - a.rating || b.wins - a.wins || b.xp - a.xp);
+  arr.sort((a, b) => (b.rating - a.rating) || (b.wins - a.wins) || (b.xp - a.xp));
   return arr.slice(0, 10);
 }
 
@@ -87,16 +85,14 @@ function computeTop10(users) {
 const app = express();
 app.set("trust proxy", 1);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked: " + origin));
-    },
-    credentials: true,
-  })
-);
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS blocked: " + origin));
+  },
+  credentials: true
+}));
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(PUBLIC_DIR));
@@ -133,15 +129,25 @@ const storage = multer.diskStorage({
     const ext = (path.extname(file.originalname) || "").toLowerCase();
     const safeExt = [".png", ".jpg", ".jpeg", ".webp"].includes(ext) ? ext : ".png";
     cb(null, `${req.user}_${Date.now()}${safeExt}`);
-  },
+  }
 });
 const upload = multer({
   storage,
- limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 2 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ok = ["image/png", "image/jpeg", "image/webp"].includes(file.mimetype);
     cb(ok ? null : new Error("Only PNG/JPG/WEBP allowed"), ok);
-  },
+  }
+});
+
+// Multer error handler (lai FE redz skaidru kļūdu)
+app.use((err, req, res, next) => {
+  if (err && err.message) {
+    if (String(err.message).includes("Only PNG/JPG/WEBP")) {
+      return res.status(400).json({ ok: false, error: "BAD_FILE_TYPE" });
+    }
+  }
+  return next(err);
 });
 
 // ---- API ----
@@ -160,7 +166,7 @@ app.post("/api/signup", async (req, res) => {
     passwordHash,
     avatarUrl: "",
     createdAt: Date.now(),
-    stats: { wins: 0, losses: 0, draws: 0, xp: 0, rating: 1000 },
+    stats: { wins: 0, losses: 0, draws: 0, xp: 0, rating: 1000 }
   };
   await atomicWriteJSON(USERS_FILE, users);
 
@@ -193,35 +199,20 @@ app.get("/api/me", authMiddleware, async (req, res) => {
   return res.json({ ok: true, user: safeUserPublic(u) });
 });
 
-app.post("/api/avatar", authMiddleware, (req, res) => {
-  upload.single("avatar")(req, res, async (err) => {
-    // 1) Multer kļūdas -> atdodam skaidru JSON
-    if (err) {
-      let code = "AVATAR_UPLOAD_FAILED";
-      if (err.code === "LIMIT_FILE_SIZE") code = "FILE_TOO_LARGE";
-      else if ((err.message || "").toLowerCase().includes("only png/jpg/webp")) code = "BAD_FILE_TYPE";
-      return res.status(400).json({ ok: false, error: code });
-    }
+app.post("/api/avatar", authMiddleware, upload.single("avatar"), async (req, res) => {
+  const users = await readUsers();
+  const key = req.user.toLowerCase();
+  const u = users[key];
+  if (!u) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    try {
-      const users = await readUsers();
-      const key = req.user.toLowerCase();
-      const u = users[key];
-      if (!u) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+  const file = req.file;
+  if (!file) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-      const file = req.file;
-      if (!file) return res.status(400).json({ ok: false, error: "NO_FILE" });
+  u.avatarUrl = `/uploads/avatars/${file.filename}`;
+  users[key] = u;
+  await atomicWriteJSON(USERS_FILE, users);
 
-      u.avatarUrl = `/uploads/avatars/${file.filename}`;
-      users[key] = u;
-      await atomicWriteJSON(USERS_FILE, users);
-
-      return res.json({ ok: true, avatarUrl: u.avatarUrl });
-    } catch (e) {
-      console.error("Avatar upload error:", e);
-      return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-    }
-  });
+  return res.json({ ok: true, avatarUrl: u.avatarUrl });
 });
 
 app.get("/api/leaderboard", async (req, res) => {
@@ -232,11 +223,15 @@ app.get("/api/leaderboard", async (req, res) => {
 // ---- Socket.IO ----
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"], credentials: true },
+  cors: {
+    origin: ALLOWED_ORIGINS,
+    methods: ["GET", "POST"],
+    credentials: true
+  }
 });
 
 // socket auth
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token || "";
     const payload = jwt.verify(token, JWT_SECRET);
@@ -263,24 +258,19 @@ function initialBoard() {
 }
 
 function cloneBoard(board) {
-  return board.map((row) => row.slice());
+  return board.map(row => row.slice());
 }
-function inBounds(r, c) {
-  return r >= 0 && r < 8 && c >= 0 && c < 8;
-}
-function isDark(r, c) {
-  return (r + c) % 2 === 1;
-}
+
+function inBounds(r, c) { return r >= 0 && r < 8 && c >= 0 && c < 8; }
+function isDark(r, c) { return (r + c) % 2 === 1; }
+
 function colorOf(p) {
   if (!p) return null;
-  return p === "w" || p === "W" ? "w" : "b";
+  return (p === "w" || p === "W") ? "w" : "b";
 }
-function isKing(p) {
-  return p === "W" || p === "B";
-}
-function opponent(color) {
-  return color === "w" ? "b" : "w";
-}
+function isKing(p) { return p === "W" || p === "B"; }
+function opponent(color) { return color === "w" ? "b" : "w"; }
+
 function promoteIfNeeded(piece, toR, color) {
   if (isKing(piece)) return piece;
   if (color === "w" && toR === 0) return "W";
@@ -288,14 +278,12 @@ function promoteIfNeeded(piece, toR, color) {
   return piece;
 }
 
+// ---- Capture sequence generation (with immediate promotion) ----
 const DIRS = [
-  [-1, -1],
-  [-1, 1],
-  [1, -1],
-  [1, 1],
+  [-1, -1], [-1, 1],
+  [1, -1], [1, 1]
 ];
 
-// ---- Capture sequence generation (with immediate promotion) ----
 function genCapturesFrom(board, r, c, piece, capturedSet) {
   const color = colorOf(piece);
   const opp = opponent(color);
@@ -304,10 +292,8 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
   if (!isKing(piece)) {
     // men capture in all diagonal directions in Russian checkers
     for (const [dr, dc] of DIRS) {
-      const mr = r + dr,
-        mc = c + dc;
-      const lr = r + 2 * dr,
-        lc = c + 2 * dc;
+      const mr = r + dr, mc = c + dc;
+      const lr = r + 2 * dr, lc = c + 2 * dc;
       if (!inBounds(lr, lc)) continue;
       if (!isDark(lr, lc)) continue;
 
@@ -331,16 +317,18 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
       nCaptured.add(midKey);
 
       const tails = genCapturesFrom(nb, lr, lc, np, nCaptured);
-      if (tails.length === 0) results.push([[lr, lc]]);
-      else for (const t of tails) results.push([[lr, lc], ...t]);
+      if (tails.length === 0) {
+        results.push([[lr, lc]]);
+      } else {
+        for (const t of tails) results.push([[lr, lc], ...t]);
+      }
     }
     return results;
   }
 
   // King capture: one opponent in line, land any empty beyond it
   for (const [dr, dc] of DIRS) {
-    let rr = r + dr,
-      cc = c + dc;
+    let rr = r + dr, cc = c + dc;
     let foundOpp = null;
 
     while (inBounds(rr, cc) && isDark(rr, cc)) {
@@ -350,11 +338,7 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
         if (foundOpp) {
           const [or, oc] = foundOpp;
           const oppKey = `${or},${oc}`;
-          if (capturedSet.has(oppKey)) {
-            rr += dr;
-            cc += dc;
-            continue;
-          }
+          if (capturedSet.has(oppKey)) { rr += dr; cc += dc; continue; }
 
           const nb = cloneBoard(board);
           nb[r][c] = null;
@@ -365,11 +349,13 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
           nCaptured.add(oppKey);
 
           const tails = genCapturesFrom(nb, rr, cc, piece, nCaptured);
-          if (tails.length === 0) results.push([[rr, cc]]);
-          else for (const t of tails) results.push([[rr, cc], ...t]);
+          if (tails.length === 0) {
+            results.push([[rr, cc]]);
+          } else {
+            for (const t of tails) results.push([[rr, cc], ...t]);
+          }
         }
-        rr += dr;
-        cc += dc;
+        rr += dr; cc += dc;
         continue;
       }
 
@@ -377,13 +363,11 @@ function genCapturesFrom(board, r, c, piece, capturedSet) {
       if (colorOf(cell) === opp) {
         if (foundOpp) break;
         foundOpp = [rr, cc];
-        rr += dr;
-        cc += dc;
+        rr += dr; cc += dc;
         continue;
       }
 
-      rr += dr;
-      cc += dc;
+      rr += dr; cc += dc;
     }
   }
 
@@ -411,7 +395,7 @@ function allCapturePlans(board, color) {
 
   const filtered = new Map();
   for (const [from, seqs] of plans.entries()) {
-    const keep = seqs.filter((s) => s.length === maxCap);
+    const keep = seqs.filter(s => s.length === maxCap);
     if (keep.length) filtered.set(from, keep);
   }
   return { mustCapture: true, maxCap, plans: filtered };
@@ -426,10 +410,9 @@ function allQuietMoves(board, color) {
       if (colorOf(p) !== color) continue;
 
       if (!isKing(p)) {
-        const dr = color === "w" ? -1 : 1;
+        const dr = (color === "w") ? -1 : 1;
         for (const dc of [-1, 1]) {
-          const nr = r + dr,
-            nc = c + dc;
+          const nr = r + dr, nc = c + dc;
           if (!inBounds(nr, nc)) continue;
           if (!isDark(nr, nc)) continue;
           if (board[nr][nc] !== null) continue;
@@ -439,14 +422,12 @@ function allQuietMoves(board, color) {
         }
       } else {
         for (const [dr, dc] of DIRS) {
-          let nr = r + dr,
-            nc = c + dc;
+          let nr = r + dr, nc = c + dc;
           while (inBounds(nr, nc) && isDark(nr, nc) && board[nr][nc] === null) {
             const key = `${r},${c}`;
             if (!moves.has(key)) moves.set(key, []);
             moves.get(key).push([nr, nc]);
-            nr += dr;
-            nc += dc;
+            nr += dr; nc += dc;
           }
         }
       }
@@ -458,8 +439,7 @@ function allQuietMoves(board, color) {
 function findCapturedSquare(board, fr, fc, tr, tc) {
   const dr = Math.sign(tr - fr);
   const dc = Math.sign(tc - fc);
-  let r = fr + dr,
-    c = fc + dc;
+  let r = fr + dr, c = fc + dc;
   let found = null;
 
   while (r !== tr && c !== tc) {
@@ -468,8 +448,7 @@ function findCapturedSquare(board, fr, fc, tr, tc) {
       if (found) return null;
       found = [r, c];
     }
-    r += dr;
-    c += dc;
+    r += dr; c += dc;
   }
   return found;
 }
@@ -497,7 +476,7 @@ function publicRoomInfo(room) {
     white: room.white ? { username: room.white.username, avatarUrl: room.white.avatarUrl || "" } : null,
     black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl || "" } : null,
     spectators: room.spectators.size,
-    status: room.status,
+    status: room.status
   };
 }
 
@@ -507,6 +486,7 @@ async function getUserPublic(username) {
   return u ? safeUserPublic(u) : null;
 }
 
+// ===== BOT helpers =====
 function rnd(min, max) {
   return Math.floor(min + Math.random() * (max - min + 1));
 }
@@ -515,6 +495,9 @@ function makeBotSeat(roomId, color) {
 }
 function seatIsBot(seat) {
   return !!seat?.isBot || (typeof seat?.username === "string" && seat.username.startsWith("BOT_"));
+}
+function isHumanSeat(seat) {
+  return !!seat && !seatIsBot(seat);
 }
 function botColor(room) {
   if (seatIsBot(room.white)) return "w";
@@ -526,9 +509,8 @@ function botUsername(room) {
   if (seatIsBot(room.black)) return room.black.username;
   return null;
 }
-function otherHumanUsername(room, color) {
-  if (color === "w") return room.black?.username && !seatIsBot(room.black) ? room.black.username : null;
-  return room.white?.username && !seatIsBot(room.white) ? room.white.username : null;
+function otherSeatUsername(room, color) {
+  return color === "w" ? room.black?.username || null : room.white?.username || null;
 }
 
 function roomStatePayload(room) {
@@ -542,6 +524,16 @@ function roomStatePayload(room) {
     black: room.black ? { username: room.black.username, avatarUrl: room.black.avatarUrl || "" } : null,
     winner: room.winner || null,
     reason: room.reason || null,
+    ranked: room.ranked
+      ? {
+          eligible: !!room.ranked.eligible,
+          status: room.ranked.status || "none",
+          winner: room.ranked.winner || null,
+          loser: room.ranked.loser || null,
+          deadline: room.ranked.deadline || null,
+          reason: room.ranked.reason || null
+        }
+      : { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null }
   };
 }
 
@@ -572,8 +564,13 @@ function buildYourMoves(room, color) {
       const nxt = seq[room.pending.stepIndex];
       if (nxt) nextTo.add(`${nxt[0]},${nxt[1]}`);
     }
-    const tos = Array.from(nextTo).map((s) => s.split(",").map((n) => parseInt(n, 10)));
-    return { pending: true, mustCapture: true, selectable: [room.pending.cur], moves: { [key]: tos } };
+    const tos = Array.from(nextTo).map(s => s.split(",").map(n => parseInt(n, 10)));
+    return {
+      pending: true,
+      mustCapture: true,
+      selectable: [room.pending.cur],
+      moves: { [key]: tos }
+    };
   }
 
   const cap = allCapturePlans(room.board, color);
@@ -581,11 +578,11 @@ function buildYourMoves(room, color) {
     const selectable = [];
     const moves = {};
     for (const [from, seqs] of cap.plans.entries()) {
-      const [fr, fc] = from.split(",").map((n) => parseInt(n, 10));
+      const [fr, fc] = from.split(",").map(n => parseInt(n, 10));
       selectable.push([fr, fc]);
       const set = new Set();
       for (const seq of seqs) set.add(`${seq[0][0]},${seq[0][1]}`);
-      moves[from] = Array.from(set).map((s) => s.split(",").map((n) => parseInt(n, 10)));
+      moves[from] = Array.from(set).map(s => s.split(",").map(n => parseInt(n, 10)));
     }
     room.turnPlan = { color, capPlans: cap.plans, maxCap: cap.maxCap };
     return { pending: false, mustCapture: true, selectable, moves };
@@ -595,7 +592,7 @@ function buildYourMoves(room, color) {
   const selectable = [];
   const moves = {};
   for (const [from, tos] of quiet.entries()) {
-    const [fr, fc] = from.split(",").map((n) => parseInt(n, 10));
+    const [fr, fc] = from.split(",").map(n => parseInt(n, 10));
     selectable.push([fr, fc]);
     moves[from] = tos;
   }
@@ -604,7 +601,8 @@ function buildYourMoves(room, color) {
 }
 
 async function updateStatsOnResult(winnerUsername, loserUsername) {
-  // BOT spēles leaderboardā NEskaitām
+  // BOT spēles leaderboardā NEskaitām (pret farmu),
+  // bet ranked forfeit gadījumā mēs sūtām tikai cilvēku nickus.
   if (!winnerUsername || !loserUsername) return;
   if (winnerUsername.startsWith("BOT_") || loserUsername.startsWith("BOT_")) return;
 
@@ -625,14 +623,38 @@ async function updateStatsOnResult(winnerUsername, loserUsername) {
   io.emit("leaderboard:top10", computeTop10(users));
 }
 
+function clearBotTimers(room) {
+  if (!room) return;
+  if (room.botTimer) {
+    clearTimeout(room.botTimer);
+    room.botTimer = null;
+  }
+  if (room.botThinkTimer) {
+    clearTimeout(room.botThinkTimer);
+    room.botThinkTimer = null;
+  }
+}
+
+function clearRankedForfeitTimer(room) {
+  if (!room) return;
+  if (room.ranked && room.ranked.timer) {
+    clearTimeout(room.ranked.timer);
+    room.ranked.timer = null;
+  }
+}
+
 function scheduleBotIfWaiting(room) {
+  // tikai ja 1 cilvēks un 1 tukša vieta (casual waiting)
   if (!room || room.status !== "waiting") return;
   if (room.botTimer) return;
 
   const wHuman = room.white && !seatIsBot(room.white);
   const bHuman = room.black && !seatIsBot(room.black);
 
-  const hasExactlyOneHuman = (wHuman && !room.black) || (bHuman && !room.white);
+  const hasExactlyOneHuman =
+    (wHuman && !room.black) ||
+    (bHuman && !room.white);
+
   if (!hasExactlyOneHuman) return;
 
   room.botTimer = setTimeout(() => {
@@ -641,11 +663,10 @@ function scheduleBotIfWaiting(room) {
     const current = rooms.get(room.id);
     if (!current || current.status !== "waiting") return;
 
-    // ja pa to laiku ienāca cilvēks -> neko nedaram
-    if (current.white && current.black) return;
-
     const wH = current.white && !seatIsBot(current.white);
     const bH = current.black && !seatIsBot(current.black);
+
+    if (current.white && current.black) return;
 
     if (wH && !current.black) current.black = makeBotSeat(current.id, "b");
     else if (bH && !current.white) current.white = makeBotSeat(current.id, "w");
@@ -659,23 +680,14 @@ function scheduleBotIfWaiting(room) {
     current.turn = "w";
     current.lastMove = null;
 
+    // casual, nav ranked
+    current.ranked = { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false };
+
     io.to(current.id).emit("game:state", roomStatePayload(current));
     emitRoomList();
 
     sendTurnMoves(current);
   }, BOT_JOIN_WAIT_MS);
-}
-
-function clearBotTimers(room) {
-  if (!room) return;
-  if (room.botTimer) {
-    clearTimeout(room.botTimer);
-    room.botTimer = null;
-  }
-  if (room.botThinkTimer) {
-    clearTimeout(room.botThinkTimer);
-    room.botThinkTimer = null;
-  }
 }
 
 function finishGame(room, winnerUsername, reason) {
@@ -693,24 +705,24 @@ function sendTurnMoves(room) {
   if (!room || room.status !== "playing") return;
 
   const turnColor = room.turn;
-  const currentSeat = turnColor === "w" ? room.white : room.black;
-  const currentUsername = currentSeat?.username;
+  const currentSeat = (turnColor === "w") ? room.white : room.black;
+  const currentUsername = currentSeat?.username || null;
 
-  // BOT gājiens
   if (seatIsBot(currentSeat)) {
-    const otherUser = otherHumanUsername(room, turnColor);
+    const otherUser = otherSeatUsername(room, turnColor);
     const otherSock = findSocketIdByUsername(otherUser);
     if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
     scheduleBotMove(room);
     return;
   }
 
-  // cilvēka gājiens
   const sId = findSocketIdByUsername(currentUsername);
-  if (sId) io.to(sId).emit("game:yourMoves", buildYourMoves(room, turnColor));
+  if (sId) {
+    const legal = buildYourMoves(room, turnColor);
+    io.to(sId).emit("game:yourMoves", legal);
+  }
 
-  // otram cilvēkam (ja ir) notīra
-  const otherUser = otherHumanUsername(room, turnColor);
+  const otherUser = otherSeatUsername(room, turnColor);
   const otherSock = findSocketIdByUsername(otherUser);
   if (otherSock) io.to(otherSock).emit("game:yourMoves", null);
 }
@@ -736,7 +748,6 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
   const piece = room.board[fr][fc];
   if (!piece || colorOf(piece) !== myColor) return { ok: false };
 
-  // server-authoritative legal check
   const legal = buildYourMoves(room, myColor);
   const key = `${fr},${fc}`;
   const allowedTos = legal?.moves?.[key] || null;
@@ -744,14 +755,13 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
   const okTo = allowedTos.some(([r, c]) => r === tr && c === tc);
   if (!okTo) return { ok: false };
 
-  // diagonal only
   const dr = tr - fr;
   const dc = tc - fc;
   if (Math.abs(dr) !== Math.abs(dc)) return { ok: false };
 
-  // capture detection
   let didCapture = false;
-  let captured = findCapturedSquare(room.board, fr, fc, tr, tc);
+  let captured = null;
+  captured = findCapturedSquare(room.board, fr, fc, tr, tc);
   if (captured) {
     const [cr, cc] = captured;
     const capPiece = room.board[cr][cc];
@@ -760,7 +770,6 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
     didCapture = true;
   }
 
-  // apply
   room.board[fr][fc] = null;
   if (didCapture) {
     const [cr, cc] = captured;
@@ -772,36 +781,42 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
 
   room.lastMove = { by: byUsername, from: [fr, fc], to: [tr, tc], capture: didCapture };
 
-  // manage pending max-capture chain
   if (didCapture) {
     if (!room.pending) {
       const plan = room.turnPlan;
       const seqs = plan?.capPlans?.get(`${fr},${fc}`) || [];
-      const matching = seqs.filter((s) => s[0][0] === tr && s[0][1] === tc);
-      room.pending = { color: myColor, cur: [tr, tc], stepIndex: 1, remainingSeqs: matching };
+      const matching = seqs.filter(s => s[0][0] === tr && s[0][1] === tc);
+      room.pending = {
+        color: myColor,
+        start: [fr, fc],
+        cur: [tr, tc],
+        stepIndex: 1,
+        remainingSeqs: matching
+      };
     } else {
       const rem = room.pending.remainingSeqs;
       const idx = room.pending.stepIndex;
-      const matching = rem.filter((s) => s[idx] && s[idx][0] === tr && s[idx][1] === tc);
+      const matching = rem.filter(s => s[idx] && s[idx][0] === tr && s[idx][1] === tc);
       room.pending.cur = [tr, tc];
       room.pending.stepIndex += 1;
       room.pending.remainingSeqs = matching;
     }
 
-    const stillHasNext = room.pending.remainingSeqs.some((s) => s[room.pending.stepIndex] != null);
-    if (stillHasNext) return { ok: true, continued: true };
+    const stillHasNext = room.pending.remainingSeqs.some(s => s[room.pending.stepIndex] != null);
+    if (stillHasNext) {
+      return { ok: true, continued: true };
+    }
 
     room.pending = null;
   }
 
-  // turn switch
   room.turn = opponent(room.turn);
   room.turnPlan = null;
 
   const oppColor = room.turn;
   const oppHas = hasAnyMove(room.board, oppColor);
   if (!oppHas) {
-    const winner = myColor === "w" ? room.white?.username : room.black?.username;
+    const winner = (myColor === "w") ? room.white?.username : room.black?.username;
     return { ok: true, finished: true, winner, reason: "NO_MOVES" };
   }
 
@@ -814,6 +829,7 @@ function scheduleBotMove(room) {
   const bc = botColor(room);
   if (!bc) return;
   if (room.turn !== bc) return;
+
   if (room.botThinkTimer) return;
 
   room.botThinkTimer = setTimeout(async () => {
@@ -827,9 +843,9 @@ function scheduleBotMove(room) {
 
     const legal = buildYourMoves(current, botC);
     const pick = pickBotMove(legal);
-
     if (!pick) {
-      const human = otherHumanUsername(current, botC);
+      // botam nav gājienu -> spēle beidzas (casual)
+      const human = otherSeatUsername(current, botC);
       finishGame(current, human, "BOT_NO_MOVES");
       return;
     }
@@ -844,10 +860,6 @@ function scheduleBotMove(room) {
 
     if (res.finished) {
       finishGame(current, res.winner, res.reason);
-      if (res.winner) {
-        const loser = otherHumanUsername(current, botC);
-        await updateStatsOnResult(res.winner, loser);
-      }
       return;
     }
 
@@ -858,6 +870,77 @@ function scheduleBotMove(room) {
 
     sendTurnMoves(current);
   }, rnd(BOT_THINK_MIN_MS, BOT_THINK_MAX_MS));
+}
+
+// ===== Ranked forfeit logic =====
+function startRankedForfeit(room, loserUsername, loserColor) {
+  if (!room || !room.ranked?.eligible) return;
+  if (!loserUsername) return;
+
+  // jau pending/awarded -> neliekam vēlreiz
+  if (room.ranked.status === "awarded") return;
+
+  const winnerUsername = otherSeatUsername(room, loserColor);
+  if (!winnerUsername) return;
+
+  // tikai ja uzvarētājs ir cilvēks (ranked vienmēr ir 2 cilvēku starts)
+  if (winnerUsername.startsWith("BOT_")) return;
+
+  clearRankedForfeitTimer(room);
+
+  const deadline = Date.now() + FORFEIT_GRACE_MS;
+  room.ranked.status = "pending";
+  room.ranked.winner = winnerUsername;
+  room.ranked.loser = loserUsername;
+  room.ranked.deadline = deadline;
+  room.ranked.reason = "DISCONNECT";
+
+  room.ranked.timer = setTimeout(async () => {
+    room.ranked.timer = null;
+
+    const current = rooms.get(room.id);
+    if (!current || !current.ranked?.eligible) return;
+    if (current.ranked.status !== "pending") return;
+
+    // ja loser atgriezās un atguva seat -> cancel
+    const seat = loserColor === "w" ? current.white : current.black;
+    if (seat && seat.username === loserUsername) {
+      current.ranked.status = "canceled";
+      current.ranked.reason = "RECONNECT_IN_TIME";
+      current.ranked.deadline = null;
+      current.ranked.winner = null;
+      current.ranked.loser = null;
+      io.to(current.id).emit("game:state", roomStatePayload(current));
+      return;
+    }
+
+    // ja vēl nav atgriezies -> AWARD ranked
+    current.ranked.status = "awarded";
+    current.ranked.reason = "FORFEIT";
+    current.ranked.deadline = null;
+
+    // lai nebūtu dubult-update
+    if (!current.ranked.awarded) {
+      current.ranked.awarded = true;
+      await updateStatsOnResult(current.ranked.winner, current.ranked.loser);
+    }
+
+    io.to(current.id).emit("game:state", roomStatePayload(current));
+  }, FORFEIT_GRACE_MS);
+}
+
+function cancelRankedForfeitIfReturning(room, username) {
+  if (!room?.ranked?.eligible) return false;
+  if (room.ranked.status !== "pending") return false;
+  if (room.ranked.loser !== username) return false;
+
+  clearRankedForfeitTimer(room);
+  room.ranked.status = "canceled";
+  room.ranked.reason = "RECONNECT_IN_TIME";
+  room.ranked.deadline = null;
+  room.ranked.winner = null;
+  room.ranked.loser = null;
+  return true;
 }
 
 // ---- Socket events ----
@@ -889,7 +972,7 @@ io.on("connection", async (socket) => {
       board: initialBoard(),
       turn: "w",
       status: "waiting",
-      white: { username: u.username, avatarUrl: u.avatarUrl },
+      white: null,
       black: null,
       spectators: new Set(),
       pending: null,
@@ -899,70 +982,58 @@ io.on("connection", async (socket) => {
       lastMove: null,
       botTimer: null,
       botThinkTimer: null,
+      ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false }
     };
+
+    room.white = { username: u.username, avatarUrl: u.avatarUrl };
+    rooms.set(id, room);
+
+    emitRoomList();
+    socket.emit("room:created", { id });
 
     if (vsBot) {
       room.black = makeBotSeat(room.id, "b");
       room.status = "playing";
-      clearBotTimers(room);
+      io.to(room.id).emit("game:state", roomStatePayload(room));
+      emitRoomList();
+      sendTurnMoves(room);
     } else {
       scheduleBotIfWaiting(room);
     }
-
-    rooms.set(id, room);
-    emitRoomList();
-    socket.emit("room:created", { id });
   });
 
-  // ======= ROOM JOIN (FIX: allowCreateIfMissing) =======
-  socket.on("room:join", async ({ id, allowCreateIfMissing } = {}) => {
+  socket.on("room:join", async ({ id }) => {
     id = String(id || "").toUpperCase().trim();
+    const room = rooms.get(id);
     const u = await getUserPublic(me);
-    if (!u) return socket.emit("room:error", { error: "UNAUTHORIZED" });
-    if (!/^[A-Z0-9]{6}$/.test(id)) return socket.emit("room:error", { error: "BAD_ROOM_CODE" });
-
-    let room = rooms.get(id);
-
-    // FIX: ja room nav atrasts, bet klients atļauj -> izveidojam jaunu room ar šo kodu
-    if (!room && allowCreateIfMissing) {
-      room = {
-        id,
-        board: initialBoard(),
-        turn: "w",
-        status: "waiting",
-        white: { username: u.username, avatarUrl: u.avatarUrl },
-        black: null,
-        spectators: new Set(),
-        pending: null,
-        turnPlan: null,
-        winner: null,
-        reason: null,
-        lastMove: null,
-        botTimer: null,
-        botThinkTimer: null,
-      };
-      rooms.set(id, room);
-      scheduleBotIfWaiting(room);
-      emitRoomList();
-    }
-
-    if (!room) return socket.emit("room:error", { error: "ROOM_NOT_FOUND" });
+    if (!room || !u) return socket.emit("room:error", { error: "ROOM_NOT_FOUND" });
 
     socket.leave("lobby");
     socket.join(id);
 
-    // ja ienāk cilvēks, atceļam bot wait timer
-    if (room.botTimer) {
-      clearTimeout(room.botTimer);
-      room.botTimer = null;
-    }
+    if (room.botTimer) { clearTimeout(room.botTimer); room.botTimer = null; }
+
+    // ja šis ir forfeit-loser un vēl pending -> atceļ forfeit
+    cancelRankedForfeitIfReturning(room, u.username);
 
     let role = "spectator";
 
-    if (!room.white || room.white.username === u.username) {
-      room.white = { username: u.username, avatarUrl: u.avatarUrl };
-      role = "white";
-    } else if (!room.black || room.black.username === u.username) {
+    // ja forfeit bija pending un loser seat ir BOT, atgūst seat
+    if (room.ranked?.eligible && room.ranked.status !== "awarded") {
+      // ja spēlētājs ir atgriezies, mēs pieļaujam seat reclaim arī tad, ja tur ir BOT
+      if (room.white && seatIsBot(room.white) && u.username === me && room.white.username.startsWith(`BOT_${room.id}_W`)) {
+        // neatgriežam automātiski te, jo nevaram zināt krāsu. Seat piešķiršanas loģika zemāk.
+      }
+    }
+
+    // seat assignment
+    if (!room.white || room.white.username === u.username || seatIsBot(room.white)) {
+      // ja white ir bot, dodam priekšroku cilvēkam
+      if (!room.white || room.white.username === u.username || seatIsBot(room.white)) {
+        room.white = { username: u.username, avatarUrl: u.avatarUrl };
+        role = "white";
+      }
+    } else if (!room.black || room.black.username === u.username || seatIsBot(room.black)) {
       room.black = { username: u.username, avatarUrl: u.avatarUrl };
       role = "black";
     } else {
@@ -979,6 +1050,15 @@ io.on("connection", async (socket) => {
       room.turn = "w";
       room.lastMove = null;
       clearBotTimers(room);
+
+      // ranked eligibility: tikai ja abi ir cilvēki starta brīdī
+      const eligible = isHumanSeat(room.white) && isHumanSeat(room.black);
+      // ja jau bija eligible iepriekš (ranked spēle) – neatceļam
+      if (!room.ranked) room.ranked = { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false };
+      if (!room.ranked.eligible) room.ranked.eligible = eligible;
+      if (!room.ranked.eligible) {
+        room.ranked.status = "none";
+      }
     } else {
       room.status = "waiting";
       room.pending = null;
@@ -1004,22 +1084,44 @@ io.on("connection", async (socket) => {
     if (!u) return;
 
     const myColor =
-      room.white?.username === u.username ? "w" : room.black?.username === u.username ? "b" : null;
+      room.white?.username === u.username ? "w" :
+      room.black?.username === u.username ? "b" : null;
+
     if (!myColor) return;
     if (room.turn !== myColor) return;
 
     const [fr, fc] = from || [];
     const [tr, tc] = to || [];
-    if (![fr, fc, tr, tc].every((n) => Number.isInteger(n))) return;
+    if (![fr, fc, tr, tc].every(n => Number.isInteger(n))) return;
 
     const res = applyMoveCore(room, myColor, [fr, fc], [tr, tc], u.username);
     io.to(id).emit("game:state", roomStatePayload(room));
+
     if (!res.ok) return;
 
     if (res.finished) {
       finishGame(room, res.winner, res.reason);
-      const loser = myColor === "w" ? room.black?.username : room.white?.username;
-      if (res.winner && loser) await updateStatsOnResult(res.winner, loser);
+
+      // Ranked stats tikai tad, ja:
+      // - spēle ir ranked eligible
+      // - nav jau awarded (forfeit dēļ)
+      // - uzvarētājs/zaudētājs ir cilvēki
+      if (room.ranked?.eligible && !room.ranked.awarded) {
+        const winner = res.winner;
+        const loser = (myColor === "w") ? room.black?.username : room.white?.username;
+        if (winner && loser && !winner.startsWith("BOT_") && !loser.startsWith("BOT_")) {
+          room.ranked.awarded = true;
+          room.ranked.status = "awarded";
+          room.ranked.reason = "NORMAL_WIN";
+          room.ranked.winner = winner;
+          room.ranked.loser = loser;
+          room.ranked.deadline = null;
+          clearRankedForfeitTimer(room);
+          await updateStatsOnResult(winner, loser);
+        }
+      }
+
+      io.to(id).emit("game:state", roomStatePayload(room));
       return;
     }
 
@@ -1041,39 +1143,82 @@ io.on("connection", async (socket) => {
     if (!u) return;
 
     const myColor =
-      room.white?.username === u.username ? "w" : room.black?.username === u.username ? "b" : null;
+      room.white?.username === u.username ? "w" :
+      room.black?.username === u.username ? "b" : null;
+
     if (!myColor) return;
 
-    const winner = myColor === "w" ? room.black?.username : room.white?.username;
+    const winner = (myColor === "w") ? room.black?.username : room.white?.username;
     finishGame(room, winner, "RESIGN");
 
-    const loser = u.username;
-    if (winner && loser) await updateStatsOnResult(winner, loser);
+    if (room.ranked?.eligible && !room.ranked.awarded) {
+      const loser = u.username;
+      if (winner && loser && !winner.startsWith("BOT_") && !loser.startsWith("BOT_")) {
+        room.ranked.awarded = true;
+        room.ranked.status = "awarded";
+        room.ranked.reason = "RESIGN";
+        room.ranked.winner = winner;
+        room.ranked.loser = loser;
+        room.ranked.deadline = null;
+        clearRankedForfeitTimer(room);
+        await updateStatsOnResult(winner, loser);
+      }
+    }
+
+    io.to(id).emit("game:state", roomStatePayload(room));
   });
 
   socket.on("disconnect", () => {
     emitOnlineCount();
 
     for (const room of rooms.values()) {
-      const wasInSeat = room.white?.username === me || room.black?.username === me;
+      const inWhite = room.white?.username === me;
+      const inBlack = room.black?.username === me;
+      const wasInSeat = inWhite || inBlack;
 
-      if (room.white?.username === me) room.white = null;
-      if (room.black?.username === me) room.black = null;
+      // vienmēr izņem no spectators
       room.spectators.delete(me);
 
-      if (wasInSeat) {
-        if (room.status === "playing") {
-          room.status = "waiting";
-          room.winner = null;
-          room.reason = null;
-          room.pending = null;
-          room.turnPlan = null;
-          clearBotTimers(room);
-        }
-        scheduleBotIfWaiting(room);
+      if (!wasInSeat) continue;
+
+      // Ja ranked spēle (eligible) un otrs ir cilvēks -> bot takeover + ranked forfeit pending
+      const quitterColor = inWhite ? "w" : "b";
+      const otherSeat = quitterColor === "w" ? room.black : room.white;
+      const otherIsHuman = isHumanSeat(otherSeat);
+
+      if (room.status === "playing" && room.ranked?.eligible && otherIsHuman && !room.ranked.awarded) {
+        // aizvieto quitter ar BOT uzreiz (lai var turpināt spēli)
+        if (quitterColor === "w") room.white = makeBotSeat(room.id, "w");
+        else room.black = makeBotSeat(room.id, "b");
+
+        // start pending forfeit taimeri
+        startRankedForfeit(room, me, quitterColor);
+
+        // informē telpu un turpina turn logic (ja BOT kārta)
         io.to(room.id).emit("game:state", roomStatePayload(room));
+        emitRoomList();
+        sendTurnMoves(room);
+        continue;
       }
 
+      // Citādi: vecais “waiting + bot pēc laika”
+      if (inWhite) room.white = null;
+      if (inBlack) room.black = null;
+
+      if (room.status === "playing") {
+        room.status = "waiting";
+        room.winner = null;
+        room.reason = null;
+        room.pending = null;
+        room.turnPlan = null;
+        clearBotTimers(room);
+      }
+
+      scheduleBotIfWaiting(room);
+      io.to(room.id).emit("game:state", roomStatePayload(room));
+      emitRoomList();
+
+      // ja nav neviena cilvēka, dzēšam room
       const hasHuman =
         (room.white && !seatIsBot(room.white)) ||
         (room.black && !seatIsBot(room.black)) ||
@@ -1081,6 +1226,7 @@ io.on("connection", async (socket) => {
 
       if (!hasHuman) {
         clearBotTimers(room);
+        clearRankedForfeitTimer(room);
         rooms.delete(room.id);
       }
     }
@@ -1093,4 +1239,5 @@ server.listen(PORT, () => {
   console.log("Bugats Dambretes server running on port", PORT);
   console.log("Allowed origins:", ALLOWED_ORIGINS);
   console.log("BOT_JOIN_WAIT_MS:", BOT_JOIN_WAIT_MS);
+  console.log("FORFEIT_GRACE_MS:", FORFEIT_GRACE_MS);
 });
