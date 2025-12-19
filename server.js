@@ -791,10 +791,58 @@ function startForfeitTimer(room, winner, loser) {
 }
 
 // ===== REMATCH / NEXT GAME (tajā pašā room) =====
-function resetRoomForNewGame(room, { forceBotIfSolo = true } = {}) {
+function resetRoomForNewGame(room, { forceBotIfSolo = true, swapColors = true } = {}) {
   clearBotTimers(room);
   clearRankedTimer(room);
 
+  // ✅ GODĪGA MAIŅA: ja ir abi sēdekļi (white+black), katrai nākamajai spēlei apmainām krāsas
+  if (swapColors && room.white && room.black) {
+    const tmp = room.white;
+    room.white = room.black;
+    room.black = tmp;
+  }
+
+  room.board = initialBoard();
+  room.turn = "w";
+  room.status = "waiting";
+
+  room.pending = null;
+  room.turnPlan = null;
+  room.winner = null;
+  room.reason = null;
+  room.lastMove = null;
+
+  room.rematch = { w: false, b: false };
+
+  ensureRanked(room);
+  room.ranked.status = "none";
+  room.ranked.winner = null;
+  room.ranked.loser = null;
+  room.ranked.deadline = null;
+  room.ranked.reason = null;
+  room.ranked.awarded = false;
+  room.ranked.timer = null;
+
+  const bothSeatsPresent = !!room.white && !!room.black;
+
+  if (!bothSeatsPresent && forceBotIfSolo) {
+    const wHuman = room.white && !seatIsBot(room.white);
+    const bHuman = room.black && !seatIsBot(room.black);
+
+    if (wHuman && !room.black) room.black = makeBotSeat(room.id, "b");
+    else if (bHuman && !room.white) room.white = makeBotSeat(room.id, "w");
+  }
+
+  if (room.white && room.black) room.status = "playing";
+  else room.status = "waiting";
+
+  // ranked tikai cilvēks pret cilvēku
+  if (room.white && room.black && !seatIsBot(room.white) && !seatIsBot(room.black)) {
+    room.ranked.eligible = true;
+  } else {
+    room.ranked.eligible = false;
+  }
+}
   room.board = initialBoard();
   room.turn = "w";
   room.status = "waiting";
