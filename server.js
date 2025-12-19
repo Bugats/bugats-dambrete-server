@@ -685,7 +685,7 @@ function scheduleBotIfWaiting(room) {
     current.turnPlan = null;
     current.lastMove = null;
 
-    // REMATCH: reset balsojumu stāvokli, ja tāds ir
+    // REMATCH reset
     current.rematch = { w: false, b: false };
 
     io.to(current.id).emit("game:state", roomStatePayload(current));
@@ -713,11 +713,81 @@ function finishGame(room, winnerUsername, reason) {
   room.pending = null;
   room.turnPlan = null;
 
-  // REMATCH: katras spēles beigās sākam ar “neviens nav apstiprinājis”
+  // REMATCH: reset uz “neviens nav apstiprinājis”
   room.rematch = { w: false, b: false };
 
   io.to(room.id).emit("game:state", roomStatePayload(room));
   emitRoomList();
+}
+
+// ===== Ranked forfeit (disconnect) =====
+function ensureRanked(room) {
+  if (!room.ranked) {
+    room.ranked = {
+      eligible: false,
+      status: "none",
+      winner: null,
+      loser: null,
+      deadline: null,
+      reason: null,
+      timer: null,
+      awarded: false
+    };
+  }
+}
+function clearRankedTimer(room) {
+  if (room?.ranked?.timer) {
+    clearTimeout(room.ranked.timer);
+    room.ranked.timer = null;
+  }
+}
+function cancelForfeitIfReturning(room, username) {
+  if (!room?.ranked) return;
+  if (room.ranked.status !== "pending") return;
+  if (room.ranked.loser !== username) return;
+
+  clearRankedTimer(room);
+  room.ranked.status = "none";
+  room.ranked.winner = null;
+  room.ranked.loser = null;
+  room.ranked.deadline = null;
+  room.ranked.reason = null;
+  room.ranked.awarded = false;
+}
+function startForfeitTimer(room, winner, loser) {
+  ensureRanked(room);
+  if (!room.ranked.eligible) return;
+  if (room.ranked.awarded) return;
+  if (room.ranked.status === "pending") return;
+
+  room.ranked.status = "pending";
+  room.ranked.winner = winner;
+  room.ranked.loser = loser;
+  room.ranked.deadline = Date.now() + FORFEIT_GRACE_MS;
+  room.ranked.reason = "DISCONNECT";
+  room.ranked.awarded = false;
+
+  clearRankedTimer(room);
+  room.ranked.timer = setTimeout(async () => {
+    const stillLoserMissing =
+      room.white?.username !== loser &&
+      room.black?.username !== loser;
+
+    if (!stillLoserMissing) {
+      cancelForfeitIfReturning(room, loser);
+      io.to(room.id).emit("game:state", roomStatePayload(room));
+      return;
+    }
+
+    room.ranked.status = "awarded";
+    room.ranked.awarded = true;
+    room.ranked.timer = null;
+
+    await updateStatsOnResult(winner, loser);
+
+    io.to(room.id).emit("ranked:forfeit", { winner, loser });
+    io.to(room.id).emit("game:state", roomStatePayload(room));
+  }, FORFEIT_GRACE_MS);
 }
 
 // ===== REMATCH / NEXT GAME (tajā pašā room) =====
@@ -737,7 +807,6 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true } = {}) {
 
   room.rematch = { w: false, b: false };
 
-  // ranked status reset (eligible atkarīgs no seat)
   ensureRanked(room);
   room.ranked.status = "none";
   room.ranked.winner = null;
@@ -757,14 +826,9 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true } = {}) {
     else if (bHuman && !room.white) room.white = makeBotSeat(room.id, "w");
   }
 
-  // status
-  if (room.white && room.black) {
-    room.status = "playing";
-  } else {
-    room.status = "waiting";
-  }
+  if (room.white && room.black) room.status = "playing";
+  else room.status = "waiting";
 
-  // ranked eligible tikai, ja abi ir cilvēki
   if (room.white && room.black && !seatIsBot(room.white) && !seatIsBot(room.black)) {
     room.ranked.eligible = true;
   } else {
@@ -779,7 +843,6 @@ function sendTurnMoves(room) {
   const currentSeat = turnColor === "w" ? room.white : room.black;
   const currentUsername = currentSeat?.username || null;
 
-  // ja BOT gājiens
   if (seatIsBot(currentSeat)) {
     const otherUser = otherHumanUsername(room, turnColor);
     const otherSock = findSocketIdByUsername(otherUser);
@@ -855,7 +918,6 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
 
   room.lastMove = { by: byUsername, from: [fr, fc], to: [tr, tc], capture: didCapture };
 
-  // manage pending max-capture chain
   if (didCapture) {
     if (!room.pending) {
       const plan = room.turnPlan;
@@ -878,9 +940,7 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
     }
 
     const stillHasNext = room.pending.remainingSeqs.some((s) => s[room.pending.stepIndex] != null);
-    if (stillHasNext) {
-      return { ok: true, continued: true };
-    }
+    if (stillHasNext) return { ok: true, continued: true };
     room.pending = null;
   }
 
@@ -948,71 +1008,6 @@ function scheduleBotMove(room) {
   }, rnd(BOT_THINK_MIN_MS, BOT_THINK_MAX_MS));
 }
 
-// ===== Ranked forfeit (disconnect) =====
-function ensureRanked(room) {
-  if (!room.ranked) {
-    room.ranked = { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false };
-  }
-}
-function clearRankedTimer(room) {
-  if (room?.ranked?.timer) {
-    clearTimeout(room.ranked.timer);
-    room.ranked.timer = null;
-  }
-}
-function cancelForfeitIfReturning(room, username) {
-  if (!room?.ranked) return;
-  if (room.ranked.status !== "pending") return;
-  if (room.ranked.loser !== username) return;
-
-  clearRankedTimer(room);
-  room.ranked.status = "none";
-  room.ranked.winner = null;
-  room.ranked.loser = null;
-  room.ranked.deadline = null;
-  room.ranked.reason = null;
-  room.ranked.awarded = false;
-}
-function startForfeitTimer(room, winner, loser) {
-  ensureRanked(room);
-  if (!room.ranked.eligible) return;
-  if (room.ranked.awarded) return;
-
-  // ja jau pending ar citu – nepārrakstam
-  if (room.ranked.status === "pending") return;
-
-  room.ranked.status = "pending";
-  room.ranked.winner = winner;
-  room.ranked.loser = loser;
-  room.ranked.deadline = Date.now() + FORFEIT_GRACE_MS;
-  room.ranked.reason = "DISCONNECT";
-  room.ranked.awarded = false;
-
-  clearRankedTimer(room);
-  room.ranked.timer = setTimeout(async () => {
-    // ja loser atgriezās (ieņēma seat), tad neko
-    const stillLoserMissing =
-      (room.white?.username !== loser) &&
-      (room.black?.username !== loser);
-
-    if (!stillLoserMissing) {
-      cancelForfeitIfReturning(room, loser);
-      io.to(room.id).emit("game:state", roomStatePayload(room));
-      return;
-    }
-
-    // piešķiram ranked rezultātu (bet spēle var turpināties izklaidei pret BOT)
-    room.ranked.status = "awarded";
-    room.ranked.awarded = true;
-    room.ranked.timer = null;
-
-    await updateStatsOnResult(winner, loser);
-
-    io.to(room.id).emit("ranked:forfeit", { winner, loser });
-    io.to(room.id).emit("game:state", roomStatePayload(room));
-  }, FORFEIT_GRACE_MS);
-}
-
 // ---- Socket events ----
 io.on("connection", async (socket) => {
   const me = socket.username;
@@ -1053,7 +1048,7 @@ io.on("connection", async (socket) => {
       botTimer: null,
       botThinkTimer: null,
       ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
-      rematch: { w: false, b: false } // REMATCH
+      rematch: { w: false, b: false }
     };
 
     room.white = { username: u.username, avatarUrl: u.avatarUrl };
@@ -1107,7 +1102,7 @@ io.on("connection", async (socket) => {
         botTimer: null,
         botThinkTimer: null,
         ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
-        rematch: { w: false, b: false } // REMATCH
+        rematch: { w: false, b: false }
       };
 
       rooms.set(id, room);
@@ -1128,7 +1123,6 @@ io.on("connection", async (socket) => {
     socket.leave("lobby");
     socket.join(id);
 
-    // ja loser atgriežas forfeit logā, atceļam
     cancelForfeitIfReturning(room, u.username);
 
     if (room.botTimer) {
@@ -1138,7 +1132,6 @@ io.on("connection", async (socket) => {
 
     let role = "spectator";
 
-    // sēdvietu piešķiršana (human aizvieto botu)
     if (!room.white || room.white.username === u.username || seatIsBot(room.white)) {
       room.white = { username: u.username, avatarUrl: u.avatarUrl };
       role = "white";
@@ -1149,7 +1142,6 @@ io.on("connection", async (socket) => {
       room.spectators.add(u.username);
     }
 
-    // ja abas vietas aizpildītas -> spēlē
     if (room.white && room.black) {
       if (room.status === "waiting") {
         room.status = "playing";
@@ -1159,12 +1151,9 @@ io.on("connection", async (socket) => {
         room.turnPlan = null;
         room.lastMove = null;
         clearBotTimers(room);
-
-        // REMATCH
         room.rematch = { w: false, b: false };
       }
 
-      // ranked eligible tikai, ja abi ir cilvēki un neviena nav BOT
       ensureRanked(room);
       if (!room.ranked.eligible && !seatIsBot(room.white) && !seatIsBot(room.black)) {
         room.ranked.eligible = true;
@@ -1257,7 +1246,7 @@ io.on("connection", async (socket) => {
     const myColor =
       room.white?.username === u.username ? "w" : room.black?.username === u.username ? "b" : null;
 
-    if (!myColor) return; // spectators nevar
+    if (!myColor) return;
 
     if (!room.rematch) room.rematch = { w: false, b: false };
     room.rematch[myColor] = true;
@@ -1270,7 +1259,7 @@ io.on("connection", async (socket) => {
       room.rematch[oppColor] = true;
     }
 
-    // ja otrs nav vispār (null) -> tu vari startēt next game pret BOT
+    // ja otrs nav vispār -> tu vari startēt next game pret BOT
     if (!oppSeat) {
       resetRoomForNewGame(room, { forceBotIfSolo: true });
 
@@ -1283,10 +1272,8 @@ io.on("connection", async (socket) => {
       return;
     }
 
-    // paziņojam statusu (fronts var nerādīt, bet nekaitē)
     io.to(room.id).emit("game:rematchStatus", { w: !!room.rematch.w, b: !!room.rematch.b });
 
-    // ja abi apstiprināja -> reset + start
     if (room.rematch.w && room.rematch.b) {
       resetRoomForNewGame(room, { forceBotIfSolo: false });
 
@@ -1312,7 +1299,6 @@ io.on("connection", async (socket) => {
       if (wasInSeat && room.status === "playing") {
         ensureRanked(room);
 
-        // ja abi bija cilvēki (ranked eligible) -> start forfeit timer, bet ļaujam turpināt pret BOT
         const other = wasWhite ? room.black : room.white;
         const otherHuman = other && !seatIsBot(other) ? other.username : null;
 
@@ -1320,7 +1306,6 @@ io.on("connection", async (socket) => {
           startForfeitTimer(room, otherHuman, me);
         }
 
-        // aizvietojam ar BOT, lai spēle neapstājas
         if (wasWhite) room.white = makeBotSeat(room.id, "w");
         if (wasBlack) room.black = makeBotSeat(room.id, "b");
 
@@ -1329,15 +1314,12 @@ io.on("connection", async (socket) => {
         io.to(room.id).emit("game:state", roomStatePayload(room));
         emitRoomList();
 
-        // ja tagad botam ir gājiens, lai iet
         sendTurnMoves(room);
       } else {
-        // ja bija waiting vai finished -> vienkārši atbrīvojam seat
         if (wasWhite) room.white = null;
         if (wasBlack) room.black = null;
       }
 
-      // ja nav neviena cilvēka (seat vai spectators) -> dzēšam room
       const hasHuman =
         (room.white && !seatIsBot(room.white)) ||
         (room.black && !seatIsBot(room.black)) ||
