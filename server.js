@@ -145,7 +145,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 2 * 1024 * 1024 },
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ok = ["image/png", "image/jpeg", "image/webp"].includes(file.mimetype);
     cb(ok ? null : new Error("Only PNG/JPG/WEBP allowed"), ok);
