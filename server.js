@@ -685,6 +685,9 @@ function scheduleBotIfWaiting(room) {
     current.turnPlan = null;
     current.lastMove = null;
 
+    // REMATCH: reset balsojumu stāvokli, ja tāds ir
+    current.rematch = { w: false, b: false };
+
     io.to(current.id).emit("game:state", roomStatePayload(current));
     emitRoomList();
     sendTurnMoves(current);
@@ -710,8 +713,63 @@ function finishGame(room, winnerUsername, reason) {
   room.pending = null;
   room.turnPlan = null;
 
+  // REMATCH: katras spēles beigās sākam ar “neviens nav apstiprinājis”
+  room.rematch = { w: false, b: false };
+
   io.to(room.id).emit("game:state", roomStatePayload(room));
   emitRoomList();
+}
+
+// ===== REMATCH / NEXT GAME (tajā pašā room) =====
+function resetRoomForNewGame(room, { forceBotIfSolo = true } = {}) {
+  clearBotTimers(room);
+  clearRankedTimer(room);
+
+  room.board = initialBoard();
+  room.turn = "w";
+  room.status = "waiting";
+
+  room.pending = null;
+  room.turnPlan = null;
+  room.winner = null;
+  room.reason = null;
+  room.lastMove = null;
+
+  room.rematch = { w: false, b: false };
+
+  // ranked status reset (eligible atkarīgs no seat)
+  ensureRanked(room);
+  room.ranked.status = "none";
+  room.ranked.winner = null;
+  room.ranked.loser = null;
+  room.ranked.deadline = null;
+  room.ranked.reason = null;
+  room.ranked.awarded = false;
+  room.ranked.timer = null;
+
+  const bothSeatsPresent = !!room.white && !!room.black;
+
+  if (!bothSeatsPresent && forceBotIfSolo) {
+    const wHuman = room.white && !seatIsBot(room.white);
+    const bHuman = room.black && !seatIsBot(room.black);
+
+    if (wHuman && !room.black) room.black = makeBotSeat(room.id, "b");
+    else if (bHuman && !room.white) room.white = makeBotSeat(room.id, "w");
+  }
+
+  // status
+  if (room.white && room.black) {
+    room.status = "playing";
+  } else {
+    room.status = "waiting";
+  }
+
+  // ranked eligible tikai, ja abi ir cilvēki
+  if (room.white && room.black && !seatIsBot(room.white) && !seatIsBot(room.black)) {
+    room.ranked.eligible = true;
+  } else {
+    room.ranked.eligible = false;
+  }
 }
 
 function sendTurnMoves(room) {
@@ -994,7 +1052,8 @@ io.on("connection", async (socket) => {
       lastMove: null,
       botTimer: null,
       botThinkTimer: null,
-      ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false }
+      ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
+      rematch: { w: false, b: false } // REMATCH
     };
 
     room.white = { username: u.username, avatarUrl: u.avatarUrl };
@@ -1006,8 +1065,10 @@ io.on("connection", async (socket) => {
     if (vsBot) {
       room.black = makeBotSeat(room.id, "b");
       room.status = "playing";
+      room.rematch = { w: false, b: false };
       io.to(room.id).emit("game:state", roomStatePayload(room));
       emitRoomList();
+      sendTurnMoves(room);
     } else {
       scheduleBotIfWaiting(room);
     }
@@ -1045,7 +1106,8 @@ io.on("connection", async (socket) => {
         lastMove: null,
         botTimer: null,
         botThinkTimer: null,
-        ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false }
+        ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
+        rematch: { w: false, b: false } // REMATCH
       };
 
       rooms.set(id, room);
@@ -1097,6 +1159,9 @@ io.on("connection", async (socket) => {
         room.turnPlan = null;
         room.lastMove = null;
         clearBotTimers(room);
+
+        // REMATCH
+        room.rematch = { w: false, b: false };
       }
 
       // ranked eligible tikai, ja abi ir cilvēki un neviena nav BOT
@@ -1177,6 +1242,61 @@ io.on("connection", async (socket) => {
 
     const loser = u.username;
     if (winner && loser) await updateStatsOnResult(winner, loser);
+  });
+
+  // ===== REMATCH event (NEXT GAME tajā pašā room) =====
+  socket.on("game:rematch", async ({ id } = {}) => {
+    id = String(id || "").toUpperCase().trim();
+    const room = rooms.get(id);
+    if (!room) return;
+    if (room.status !== "finished") return;
+
+    const u = await getUserPublic(me);
+    if (!u) return;
+
+    const myColor =
+      room.white?.username === u.username ? "w" : room.black?.username === u.username ? "b" : null;
+
+    if (!myColor) return; // spectators nevar
+
+    if (!room.rematch) room.rematch = { w: false, b: false };
+    room.rematch[myColor] = true;
+
+    const oppColor = opponent(myColor);
+    const oppSeat = oppColor === "w" ? room.white : room.black;
+
+    // ja otrs ir BOT -> automātiski piekrīt
+    if (seatIsBot(oppSeat)) {
+      room.rematch[oppColor] = true;
+    }
+
+    // ja otrs nav vispār (null) -> tu vari startēt next game pret BOT
+    if (!oppSeat) {
+      resetRoomForNewGame(room, { forceBotIfSolo: true });
+
+      io.to(room.id).emit("game:rematchStatus", null);
+      io.to(room.id).emit("game:state", roomStatePayload(room));
+      emitRoomList();
+
+      if (room.status === "playing") sendTurnMoves(room);
+      else scheduleBotIfWaiting(room);
+      return;
+    }
+
+    // paziņojam statusu (fronts var nerādīt, bet nekaitē)
+    io.to(room.id).emit("game:rematchStatus", { w: !!room.rematch.w, b: !!room.rematch.b });
+
+    // ja abi apstiprināja -> reset + start
+    if (room.rematch.w && room.rematch.b) {
+      resetRoomForNewGame(room, { forceBotIfSolo: false });
+
+      io.to(room.id).emit("game:rematchStatus", null);
+      io.to(room.id).emit("game:state", roomStatePayload(room));
+      emitRoomList();
+
+      if (room.status === "playing") sendTurnMoves(room);
+      else scheduleBotIfWaiting(room);
+    }
   });
 
   socket.on("disconnect", async () => {
