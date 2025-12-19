@@ -193,20 +193,35 @@ app.get("/api/me", authMiddleware, async (req, res) => {
   return res.json({ ok: true, user: safeUserPublic(u) });
 });
 
-app.post("/api/avatar", authMiddleware, upload.single("avatar"), async (req, res) => {
-  const users = await readUsers();
-  const key = req.user.toLowerCase();
-  const u = users[key];
-  if (!u) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+app.post("/api/avatar", authMiddleware, (req, res) => {
+  upload.single("avatar")(req, res, async (err) => {
+    // 1) Multer kļūdas -> atdodam skaidru JSON
+    if (err) {
+      let code = "AVATAR_UPLOAD_FAILED";
+      if (err.code === "LIMIT_FILE_SIZE") code = "FILE_TOO_LARGE";
+      else if ((err.message || "").toLowerCase().includes("only png/jpg/webp")) code = "BAD_FILE_TYPE";
+      return res.status(400).json({ ok: false, error: code });
+    }
 
-  const file = req.file;
-  if (!file) return res.status(400).json({ ok: false, error: "NO_FILE" });
+    try {
+      const users = await readUsers();
+      const key = req.user.toLowerCase();
+      const u = users[key];
+      if (!u) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-  u.avatarUrl = `/uploads/avatars/${file.filename}`;
-  users[key] = u;
-  await atomicWriteJSON(USERS_FILE, users);
+      const file = req.file;
+      if (!file) return res.status(400).json({ ok: false, error: "NO_FILE" });
 
-  return res.json({ ok: true, avatarUrl: u.avatarUrl });
+      u.avatarUrl = `/uploads/avatars/${file.filename}`;
+      users[key] = u;
+      await atomicWriteJSON(USERS_FILE, users);
+
+      return res.json({ ok: true, avatarUrl: u.avatarUrl });
+    } catch (e) {
+      console.error("Avatar upload error:", e);
+      return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    }
+  });
 });
 
 app.get("/api/leaderboard", async (req, res) => {
