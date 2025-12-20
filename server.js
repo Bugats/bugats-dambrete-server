@@ -503,6 +503,11 @@ function makeRoomId() {
   for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
   return out;
 }
+function makeUniqueRoomId() {
+  let id = makeRoomId();
+  while (rooms.has(id)) id = makeRoomId();
+  return id;
+}
 
 function publicRoomInfo(room) {
   return {
@@ -518,6 +523,70 @@ async function getUserPublic(username) {
   const users = await readUsers();
   const u = users[username.toLowerCase()];
   return u ? safeUserPublic(u) : null;
+}
+
+// ===== Lobby ONLINE list (tikai tie, kas ir "lobby" room) =====
+function getLobbySocketIds() {
+  return io.sockets.adapter.rooms.get("lobby") || new Set();
+}
+
+function findLobbySocketByUsernameCI(username) {
+  const wanted = String(username || "").toLowerCase();
+  if (!wanted) return null;
+
+  for (const sid of getLobbySocketIds()) {
+    const s = io.of("/").sockets.get(sid);
+    const u = String(s?.username || "").toLowerCase();
+    if (u && u === wanted) return s;
+  }
+  return null;
+}
+
+async function emitOnlineList() {
+  try {
+    const users = await readUsers();
+    const seen = new Set();
+    const list = [];
+
+    for (const sid of getLobbySocketIds()) {
+      const s = io.of("/").sockets.get(sid);
+      const uname = s?.username;
+      if (!uname) continue;
+
+      const key = uname.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const u = users[key];
+      if (u) {
+        list.push({ username: u.username, avatarUrl: u.avatarUrl || "" });
+      } else {
+        list.push({ username: uname, avatarUrl: "" });
+      }
+    }
+
+    list.sort((a, b) => a.username.localeCompare(b.username, "lv"));
+    io.to("lobby").emit("online:list", list);
+  } catch {
+    // ignorējam (nekritiska funkcija)
+  }
+}
+
+function emitRoomList() {
+  const list = Array.from(rooms.values()).map(publicRoomInfo);
+  io.to("lobby").emit("room:list", list);
+}
+
+function emitOnlineCount() {
+  io.emit("online:count", io.engine.clientsCount);
+}
+
+function findSocketIdByUsername(username) {
+  if (!username) return null;
+  for (const [id, s] of io.of("/").sockets) {
+    if (s.username === username) return id;
+  }
+  return null;
 }
 
 // ===== BOT helpers =====
@@ -610,23 +679,6 @@ function roomStatePayload(room) {
         }
       : { eligible: false, status: "none", winner: null, loser: null, deadline: null, awarded: false, reason: null }
   };
-}
-
-function emitRoomList() {
-  const list = Array.from(rooms.values()).map(publicRoomInfo);
-  io.to("lobby").emit("room:list", list);
-}
-
-function emitOnlineCount() {
-  io.emit("online:count", io.engine.clientsCount);
-}
-
-function findSocketIdByUsername(username) {
-  if (!username) return null;
-  for (const [id, s] of io.of("/").sockets) {
-    if (s.username === username) return id;
-  }
-  return null;
 }
 
 // ===== Turn move packaging =====
@@ -1066,16 +1118,76 @@ io.on("connection", async (socket) => {
   socket.emit("leaderboard:top10", computeTop10(users));
   emitRoomList();
 
+  // ✅ online lobby list (cilvēki, kurus var uzaicināt)
+  emitOnlineList();
+
   socket.on("lobby:hello", async () => {
     const u = await getUserPublic(me);
     socket.emit("me", u);
     emitRoomList();
     emitOnlineCount();
+    emitOnlineList();
+  });
+
+  // ✅ INVITE: izveido room + nosūta ielūgumu (tikai tiem, kas IR lobby)
+  socket.on("invite:create", async ({ to } = {}) => {
+    try {
+      const targetName = String(to || "").trim();
+      if (!validUsername(targetName)) {
+        return socket.emit("invite:error", { error: "BAD_TARGET" });
+      }
+      if (targetName.toLowerCase() === String(me).toLowerCase()) {
+        return socket.emit("invite:error", { error: "CANT_INVITE_SELF" });
+      }
+
+      // tikai lobby cilvēkiem (lai 100% saņem app.js pusē)
+      const targetSock = findLobbySocketByUsernameCI(targetName);
+      if (!targetSock) {
+        return socket.emit("invite:error", { error: "USER_NOT_IN_LOBBY" });
+      }
+
+      const u = await getUserPublic(me);
+      if (!u) return socket.emit("invite:error", { error: "NOT_AUTH" });
+
+      const id = makeUniqueRoomId();
+
+      const room = {
+        id,
+        board: initialBoard(),
+        turn: "w",
+        status: "waiting",
+        white: { username: u.username, avatarUrl: u.avatarUrl },
+        black: null,
+        spectators: new Set(),
+        pending: null,
+        turnPlan: null,
+        winner: null,
+        reason: null,
+        lastMove: null,
+        botTimer: null,
+        botThinkTimer: null,
+        ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
+        rematch: { w: false, b: false },
+        vsBotAlt: false
+      };
+
+      rooms.set(id, room);
+      emitRoomList();
+      scheduleBotIfWaiting(room);
+
+      // ielūgums
+      targetSock.emit("invite:received", { id, from: u.username });
+
+      // apstiprinājums inviterim
+      socket.emit("invite:created", { id, to: targetSock.username });
+    } catch (e) {
+      socket.emit("invite:error", { error: "INVITE_FAILED" });
+    }
   });
 
   // room:create (optional vsBot flag)
   socket.on("room:create", async ({ vsBot } = {}) => {
-    const id = makeRoomId();
+    const id = makeUniqueRoomId();
     const u = await getUserPublic(me);
     if (!u) return;
 
@@ -1161,6 +1273,7 @@ io.on("connection", async (socket) => {
       socket.join(id);
 
       emitRoomList();
+      emitOnlineList();
       scheduleBotIfWaiting(room);
 
       io.to(id).emit("game:state", roomStatePayload(room));
@@ -1172,6 +1285,9 @@ io.on("connection", async (socket) => {
     // room eksistē
     socket.leave("lobby");
     socket.join(id);
+
+    // lobby list refresh
+    emitOnlineList();
 
     cancelForfeitIfReturning(room, u.username);
 
@@ -1406,6 +1522,9 @@ io.on("connection", async (socket) => {
 
   socket.on("disconnect", async () => {
     emitOnlineCount();
+
+    // online lobby list update (pēc disconnect)
+    emitOnlineList();
 
     for (const room of rooms.values()) {
       const wasWhite = room.white?.username === me;
