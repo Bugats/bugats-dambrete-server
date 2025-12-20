@@ -1224,6 +1224,74 @@ io.on("connection", async (socket) => {
     else socket.emit("game:yourMoves", null);
   });
 
+  // ⚡ Spēlēt pret BOT tagad (nevis gaidīt BOT_JOIN_WAIT_MS)
+  socket.on("room:forceBot", async ({ id } = {}) => {
+    id = String(id || "").toUpperCase().trim();
+    const room = rooms.get(id);
+    if (!room) return;
+
+    // drīkst tikai, ja vēl GAIDA (nav sācies PvP)
+    if (room.status !== "waiting") return;
+
+    const u = await getUserPublic(me);
+    if (!u) return;
+
+    // tikai sēdošais spēlētājs (white/black), nevis spectators
+    const mySeatColor =
+      room.white?.username === u.username ? "w" :
+      room.black?.username === u.username ? "b" :
+      null;
+
+    if (!mySeatColor) return;
+
+    // ja jau ir otrs cilvēks, tad neko (spēlē pret spēlētāju)
+    const hasHumanWhite = room.white && !seatIsBot(room.white);
+    const hasHumanBlack = room.black && !seatIsBot(room.black);
+    if (hasHumanWhite && hasHumanBlack) return;
+
+    clearBotTimers(room);
+
+    // reset stāvoklis, lai jaunā spēle sākas tīri
+    room.board = initialBoard();
+    room.turn = "w";
+    room.pending = null;
+    room.turnPlan = null;
+    room.winner = null;
+    room.reason = null;
+    room.lastMove = null;
+    room.rematch = { w: false, b: false };
+
+    // ranked nav pret BOT
+    ensureRanked(room);
+    room.ranked.eligible = false;
+    room.ranked.status = "none";
+    room.ranked.winner = null;
+    room.ranked.loser = null;
+    room.ranked.deadline = null;
+    room.ranked.reason = null;
+    room.ranked.awarded = false;
+    room.ranked.timer = null;
+
+    // ieliekam BOT tukšajā pusē, saglabājot tavu esošo krāsu
+    if (mySeatColor === "w") {
+      if (!room.black || seatIsBot(room.black)) {
+        room.black = makeBotSeat(room.id, "b");
+      }
+      room.vsBotAlt = false;
+    } else {
+      if (!room.white || seatIsBot(room.white)) {
+        room.white = makeBotSeat(room.id, "w");
+      }
+      room.vsBotAlt = true;
+    }
+
+    room.status = "playing";
+
+    io.to(room.id).emit("game:state", roomStatePayload(room));
+    emitRoomList();
+    sendTurnMoves(room);
+  });
+
   socket.on("game:move", async ({ id, from, to }) => {
     id = String(id || "").toUpperCase().trim();
     const room = rooms.get(id);
