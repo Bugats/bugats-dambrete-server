@@ -27,6 +27,9 @@ const BOT_THINK_MAX_MS = parseInt(process.env.BOT_THINK_MAX_MS || "900", 10);
 // Ranked disconnect forfeit (ja neatgriežas)
 const FORFEIT_GRACE_MS = parseInt(process.env.FORFEIT_GRACE_MS || "20000", 10);
 
+// ===== INVITES (challenge) konfigurācija =====
+const INVITE_TTL_MS = parseInt(process.env.INVITE_TTL_MS || "30000", 10); // 30s
+
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
@@ -497,6 +500,12 @@ function hasAnyMove(board, color) {
 // ---- Rooms & state ----
 const rooms = new Map(); // roomId -> roomState
 
+// ===== ONLINE + INVITES (server-side presence) =====
+// onlineUsers: usernameLower -> { username, avatarUrl, sockets: Map(socketId -> { inLobby, lastSeen }) }
+const onlineUsers = new Map();
+// invites: inviteId -> { inviteId, from, to, roomId, timer }
+const invites = new Map();
+
 function makeRoomId() {
   const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let out = "";
@@ -518,6 +527,154 @@ async function getUserPublic(username) {
   const users = await readUsers();
   const u = users[username.toLowerCase()];
   return u ? safeUserPublic(u) : null;
+}
+
+function emitRoomList() {
+  const list = Array.from(rooms.values()).map(publicRoomInfo);
+  io.to("lobby").emit("room:list", list);
+}
+
+function emitOnlineCount() {
+  io.emit("online:count", io.engine.clientsCount);
+}
+
+function findSocketIdByUsername(username) {
+  if (!username) return null;
+  for (const [id, s] of io.of("/").sockets) {
+    if (s.username === username) return id;
+  }
+  return null;
+}
+
+// ---- ONLINE helpers ----
+function presenceKey(username) {
+  return String(username || "").toLowerCase();
+}
+
+function upsertPresenceSocket(username, avatarUrl, socketId, inLobby) {
+  const key = presenceKey(username);
+  if (!key) return;
+  let entry = onlineUsers.get(key);
+  if (!entry) {
+    entry = { username, avatarUrl: avatarUrl || "", sockets: new Map() };
+  }
+  // atjauno public info (ja avatar mainās)
+  entry.username = username;
+  entry.avatarUrl = avatarUrl || entry.avatarUrl || "";
+  entry.sockets.set(socketId, { inLobby: !!inLobby, lastSeen: Date.now() });
+  onlineUsers.set(key, entry);
+}
+
+function setPresenceSocketLobby(username, socketId, inLobby) {
+  const key = presenceKey(username);
+  const entry = onlineUsers.get(key);
+  if (!entry) return;
+  const s = entry.sockets.get(socketId);
+  if (!s) return;
+  s.inLobby = !!inLobby;
+  s.lastSeen = Date.now();
+  entry.sockets.set(socketId, s);
+  onlineUsers.set(key, entry);
+}
+
+function removePresenceSocket(username, socketId) {
+  const key = presenceKey(username);
+  const entry = onlineUsers.get(key);
+  if (!entry) return;
+  entry.sockets.delete(socketId);
+  if (entry.sockets.size === 0) {
+    onlineUsers.delete(key);
+  } else {
+    onlineUsers.set(key, entry);
+  }
+}
+
+function presenceAvailability(entry) {
+  let anyLobby = false;
+  let anyNotLobby = false;
+  for (const s of entry.sockets.values()) {
+    if (s.inLobby) anyLobby = true;
+    else anyNotLobby = true;
+  }
+  const available = anyLobby && !anyNotLobby; // visi socketi ir lobby (un vismaz 1)
+  return { available, anyLobby, anyNotLobby };
+}
+
+function emitOnlineList() {
+  const list = Array.from(onlineUsers.values())
+    .filter((e) => e && e.username && !String(e.username).startsWith("BOT_"))
+    .map((e) => {
+      const st = presenceAvailability(e);
+      return {
+        username: e.username,
+        avatarUrl: e.avatarUrl || "",
+        inLobby: !!st.available // UI: true => "Lobby", false => "Spēlē/BUSY"
+      };
+    })
+    .sort((a, b) => a.username.localeCompare(b.username));
+
+  io.to("lobby").emit("online:list", list);
+}
+
+function getOnlineUserByName(name) {
+  const key = presenceKey(name);
+  if (!key) return null;
+  const entry = onlineUsers.get(key);
+  if (!entry) return null;
+  return entry;
+}
+
+function pickLobbySocketIdForUser(username) {
+  const entry = getOnlineUserByName(username);
+  if (!entry) return null;
+  // atgriež socket, kas ir lobby
+  for (const [sid, meta] of entry.sockets.entries()) {
+    if (meta.inLobby) return sid;
+  }
+  return null;
+}
+
+function emitToUserLobbySockets(username, event, data) {
+  const entry = getOnlineUserByName(username);
+  if (!entry) return;
+  for (const [sid, meta] of entry.sockets.entries()) {
+    if (!meta.inLobby) continue;
+    const sock = io.of("/").sockets.get(sid);
+    if (!sock) continue;
+    sock.emit(event, data);
+  }
+}
+
+// ---- INVITE helpers ----
+function makeInviteId() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cleanupInvite(inviteId, reason = "CANCELLED") {
+  const inv = invites.get(inviteId);
+  if (!inv) return;
+
+  if (inv.timer) {
+    clearTimeout(inv.timer);
+    inv.timer = null;
+  }
+
+  // ja room vēl ir “invite-only waiting”, izmetam ārā
+  const room = rooms.get(inv.roomId);
+  if (room && room.status === "waiting" && room.inviteOnly) {
+    clearBotTimers(room);
+    clearRankedTimer(room);
+    rooms.delete(room.id);
+    emitRoomList();
+  }
+
+  invites.delete(inviteId);
+
+  // nečakarējam UI ar "ended" uz ACCEPTED – tur būs invite:go
+  if (reason !== "ACCEPTED") {
+    emitToUserLobbySockets(inv.from, "invite:ended", { inviteId, reason });
+    emitToUserLobbySockets(inv.to, "invite:ended", { inviteId, reason });
+  }
 }
 
 // ===== BOT helpers =====
@@ -612,23 +769,6 @@ function roomStatePayload(room) {
   };
 }
 
-function emitRoomList() {
-  const list = Array.from(rooms.values()).map(publicRoomInfo);
-  io.to("lobby").emit("room:list", list);
-}
-
-function emitOnlineCount() {
-  io.emit("online:count", io.engine.clientsCount);
-}
-
-function findSocketIdByUsername(username) {
-  if (!username) return null;
-  for (const [id, s] of io.of("/").sockets) {
-    if (s.username === username) return id;
-  }
-  return null;
-}
-
 // ===== Turn move packaging =====
 function buildYourMoves(room, color) {
   // pending chain: only that piece can move
@@ -698,6 +838,10 @@ async function updateStatsOnResult(winnerUsername, loserUsername) {
 
 function scheduleBotIfWaiting(room) {
   if (!room || room.status !== "waiting") return;
+
+  // ✅ invite rooms: nekad neliekam auto-BOT
+  if (room.noAutoBot) return;
+
   if (room.botTimer) return;
 
   const wHuman = room.white && !seatIsBot(room.white);
@@ -711,6 +855,10 @@ function scheduleBotIfWaiting(room) {
 
     const current = rooms.get(room.id);
     if (!current || current.status !== "waiting") return;
+
+    // ✅ drošība: ja pa vidu kļuva par invite room, nekas
+    if (current.noAutoBot) return;
+
     if (current.white && current.black) return;
 
     const wH = current.white && !seatIsBot(current.white);
@@ -1062,6 +1210,12 @@ io.on("connection", async (socket) => {
   socket.join("lobby");
   emitOnlineCount();
 
+  // ===== presence: pievienojam ONLINE sarakstā kā “lobby” =====
+  // (ņemam avatar no users.json, lai online sarakstā rādās avatāri)
+  const mePub0 = await getUserPublic(me);
+  upsertPresenceSocket(me, mePub0?.avatarUrl || "", socket.id, true);
+  emitOnlineList();
+
   const users = await readUsers();
   socket.emit("leaderboard:top10", computeTop10(users));
   emitRoomList();
@@ -1069,8 +1223,151 @@ io.on("connection", async (socket) => {
   socket.on("lobby:hello", async () => {
     const u = await getUserPublic(me);
     socket.emit("me", u);
+
+    // ja avatar mainīts, atjaunojam presence
+    upsertPresenceSocket(me, u?.avatarUrl || "", socket.id, true);
+    emitOnlineList();
+
     emitRoomList();
     emitOnlineCount();
+  });
+
+  // ===== INVITES (challenge) =====
+  socket.on("invite:send", async ({ to } = {}) => {
+    const targetName = String(to || "").trim();
+    if (!targetName) return socket.emit("invite:error", { error: "NO_TARGET" });
+
+    // tikai no lobby
+    if (!socket.rooms.has("lobby")) {
+      return socket.emit("invite:error", { error: "NOT_IN_LOBBY" });
+    }
+
+    const targetEntry = getOnlineUserByName(targetName);
+    if (!targetEntry) return socket.emit("invite:error", { error: "USER_OFFLINE" });
+
+    const st = presenceAvailability(targetEntry);
+    if (!st.available) return socket.emit("invite:error", { error: "USER_BUSY" });
+
+    if (String(targetEntry.username).toLowerCase() === String(me).toLowerCase()) {
+      return socket.emit("invite:error", { error: "CANT_INVITE_SELF" });
+    }
+
+    const targetSocketId = pickLobbySocketIdForUser(targetEntry.username);
+    if (!targetSocketId) return socket.emit("invite:error", { error: "USER_OFFLINE" });
+
+    const u = await getUserPublic(me);
+    if (!u) return socket.emit("invite:error", { error: "NO_ME" });
+
+    // izveido invite room ar unikālu id
+    let roomId = makeRoomId();
+    while (rooms.has(roomId)) roomId = makeRoomId();
+
+    const room = {
+      id: roomId,
+      board: initialBoard(),
+      turn: "w",
+      status: "waiting",
+      white: { username: u.username, avatarUrl: u.avatarUrl },
+      black: null,
+      spectators: new Set(),
+      pending: null,
+      turnPlan: null,
+      winner: null,
+      reason: null,
+      lastMove: null,
+      botTimer: null,
+      botThinkTimer: null,
+      ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
+      rematch: { w: false, b: false },
+      vsBotAlt: false,
+
+      // invite locks
+      inviteOnly: true,
+      invite: { from: u.username, to: targetEntry.username },
+      noAutoBot: true
+    };
+
+    rooms.set(roomId, room);
+    emitRoomList();
+
+    const inviteId = makeInviteId();
+    const timer = setTimeout(() => cleanupInvite(inviteId, "EXPIRED"), INVITE_TTL_MS);
+
+    invites.set(inviteId, {
+      inviteId,
+      from: u.username,
+      to: targetEntry.username,
+      roomId,
+      timer
+    });
+
+    socket.emit("invite:sent", { inviteId, to: targetEntry.username });
+    io.to(targetSocketId).emit("invite:incoming", {
+      inviteId,
+      from: u.username,
+      roomId
+    });
+  });
+
+  socket.on("invite:accept", async ({ inviteId } = {}) => {
+    inviteId = String(inviteId || "").trim();
+    const inv = invites.get(inviteId);
+    if (!inv) return socket.emit("invite:error", { error: "INVITE_NOT_FOUND" });
+
+    if (String(inv.to).toLowerCase() !== String(me).toLowerCase()) {
+      return socket.emit("invite:error", { error: "NOT_INVITED_USER" });
+    }
+
+    const room = rooms.get(inv.roomId);
+    if (!room) {
+      cleanupInvite(inviteId, "ROOM_GONE");
+      return;
+    }
+
+    const mePub = await getUserPublic(me);
+    if (!mePub) return socket.emit("invite:error", { error: "NO_ME" });
+
+    // rezervējam BLACK uzaicinātajam, bet status paliek waiting līdz reālai pievienošanai game lapā
+    room.black = { username: mePub.username, avatarUrl: mePub.avatarUrl };
+    room.inviteOnly = false;
+    room.invite = null;
+    room.noAutoBot = false;
+
+    // ranked būs eligible, kad abi ir cilvēki (tas jau notiek arī room:join, bet šeit droši)
+    ensureRanked(room);
+    if (!seatIsBot(room.white) && !seatIsBot(room.black)) {
+      room.ranked.eligible = true;
+    }
+
+    // iztīram invite (bez invite:ended)
+    cleanupInvite(inviteId, "ACCEPTED");
+
+    // abiem dodam signālu pāriet uz spēli (game.html?room=...)
+    emitToUserLobbySockets(inv.from, "invite:go", { roomId: room.id });
+    emitToUserLobbySockets(inv.to, "invite:go", { roomId: room.id });
+
+    emitRoomList();
+  });
+
+  socket.on("invite:decline", async ({ inviteId } = {}) => {
+    inviteId = String(inviteId || "").trim();
+    const inv = invites.get(inviteId);
+    if (!inv) return;
+
+    if (String(inv.to).toLowerCase() !== String(me).toLowerCase()) return;
+
+    cleanupInvite(inviteId, "DECLINED");
+    emitToUserLobbySockets(inv.from, "invite:declined", { inviteId, by: me });
+  });
+
+  socket.on("invite:cancel", async ({ inviteId } = {}) => {
+    inviteId = String(inviteId || "").trim();
+    const inv = invites.get(inviteId);
+    if (!inv) return;
+
+    if (String(inv.from).toLowerCase() !== String(me).toLowerCase()) return;
+
+    cleanupInvite(inviteId, "CANCELLED");
   });
 
   // room:create (optional vsBot flag)
@@ -1160,6 +1457,10 @@ io.on("connection", async (socket) => {
       socket.leave("lobby");
       socket.join(id);
 
+      // presence: šis socket vairs nav lobby
+      setPresenceSocketLobby(me, socket.id, false);
+      emitOnlineList();
+
       emitRoomList();
       scheduleBotIfWaiting(room);
 
@@ -1173,11 +1474,31 @@ io.on("connection", async (socket) => {
     socket.leave("lobby");
     socket.join(id);
 
+    // presence: šis socket vairs nav lobby
+    setPresenceSocketLobby(me, socket.id, false);
+    emitOnlineList();
+
     cancelForfeitIfReturning(room, u.username);
 
     if (room.botTimer) {
       clearTimeout(room.botTimer);
       room.botTimer = null;
+    }
+
+    // ✅ Invite-only: svešie nevar paņemt seat, tikai spectator
+    if (room.inviteOnly && room.invite) {
+      const allowA = String(room.invite.from || "").toLowerCase();
+      const allowB = String(room.invite.to || "").toLowerCase();
+      const who = String(u.username || "").toLowerCase();
+
+      if (who !== allowA && who !== allowB) {
+        room.spectators.add(u.username);
+        io.to(id).emit("game:state", roomStatePayload(room));
+        emitRoomList();
+        socket.emit("room:joined", { id, role: "spectator" });
+        socket.emit("game:yourMoves", null);
+        return;
+      }
     }
 
     let role = "spectator";
@@ -1223,6 +1544,7 @@ io.on("connection", async (socket) => {
     if (room.status === "playing") sendTurnMoves(room);
     else socket.emit("game:yourMoves", null);
   });
+
   // ⚡ Spēlēt pret BOT tagad (nevis gaidīt BOT_JOIN_WAIT_MS)
   socket.on("room:forceBot", async ({ id } = {}) => {
     id = String(id || "").toUpperCase().trim();
@@ -1248,8 +1570,9 @@ io.on("connection", async (socket) => {
     const hasHumanBlack = room.black && !seatIsBot(room.black);
     if (hasHumanWhite && hasHumanBlack) return;
 
-    // ja jau ir BOT otrā vietā, tad tikai pārliekam statusu uz playing, ja vajag
-    // (bet parasti tas nenotiek, jo tad status būs playing)
+    // ja tas ir invite-only room, šo neļaujam (tā ir PvP uzaicinājuma istaba)
+    if (room.inviteOnly) return;
+
     clearBotTimers(room);
 
     // reset stāvoklis, lai jaunā spēle sākas tīri
@@ -1408,6 +1731,10 @@ io.on("connection", async (socket) => {
   });
 
   socket.on("disconnect", async () => {
+    // presence
+    removePresenceSocket(me, socket.id);
+    emitOnlineList();
+
     emitOnlineCount();
 
     for (const room of rooms.values()) {
@@ -1462,4 +1789,5 @@ server.listen(PORT, () => {
   console.log("Allowed origins:", ALLOWED_ORIGINS);
   console.log("BOT_JOIN_WAIT_MS:", BOT_JOIN_WAIT_MS);
   console.log("FORFEIT_GRACE_MS:", FORFEIT_GRACE_MS);
+  console.log("INVITE_TTL_MS:", INVITE_TTL_MS);
 });
