@@ -1478,8 +1478,19 @@ io.on("connection", async (socket) => {
 
   // ============================================================
   // REMATCH (JAUNĀ loģika): Request -> Opponent YES/NO
-  // Saglabājam arī veco eventu "game:rematch" kā alias.
+  // - atbalsta game.js ar: game:rematchOffered + game:rematchDecline
+  // - atbalsta arī vecos eventus: game:rematchPrompt / game:rematchRequest / game:rematchAnswer
+  // - game:rematch paliek kā alias (savietojamība)
   // ============================================================
+
+  function emitStartNewGame(room, { forceBotIfSolo, swapColors } = {}) {
+    resetRoomForNewGame(room, { forceBotIfSolo: !!forceBotIfSolo, swapColors: swapColors !== false });
+    io.to(room.id).emit("game:rematchStatus", null);
+    io.to(room.id).emit("game:state", roomStatePayload(room));
+    emitRoomList();
+    if (room.status === "playing") sendTurnMoves(room);
+    else scheduleBotIfWaiting(room);
+  }
 
   async function handleRematchRequest({ id } = {}) {
     id = String(id || "").toUpperCase().trim();
@@ -1503,15 +1514,23 @@ io.on("connection", async (socket) => {
     const oppColor = opponent(myColor);
     const oppSeat = oppColor === "w" ? room.white : room.black;
 
-    // Ja jau ir pending un TU esi uzaicinātais -> uzskatām to par ACCEPT (savietojamība)
+    // Ja ir pending un TU esi uzaicinātais -> ACCEPT (lai game:rematch paliek ērts)
     if (room.rematchPending && room.rematchPending.to === u.username) {
       return handleRematchAnswer({ id, accept: true });
     }
 
-    // Ja pending jau eksistē un tu esi requester -> vienkārši pasaki, ka gaida
+    // Ja pending jau eksistē un tu esi requester -> pasaki “gaida”
     if (room.rematchPending && room.rematchPending.from === u.username) {
       socket.emit("game:rematchPending", { to: room.rematchPending.to });
       io.to(room.id).emit("game:rematchStatus", { w: !!room.rematch.w, b: !!room.rematch.b });
+      return;
+    }
+
+    // Ja pretinieks nav seat (viens pats) -> startē next game (ar BOT, ja vajag)
+    if (!oppSeat) {
+      room.rematchPending = null;
+      io.to(room.id).emit("game:rematchStatus", null);
+      emitStartNewGame(room, { forceBotIfSolo: true, swapColors: true });
       return;
     }
 
@@ -1519,23 +1538,8 @@ io.on("connection", async (socket) => {
     if (seatIsBot(oppSeat)) {
       room.rematch[oppColor] = true;
       room.rematchPending = null;
-
-      resetRoomFor_newSafe(room);
-
-      return;
-    }
-
-    // Ja nav pretinieka seat (viens pats) -> var startēt next game (ar BOT, ja vajag)
-    if (!oppSeat) {
-      room.rematchPending = null;
-
-      resetRoomForNewGame(room, { forceBotIfSolo: true, swapColors: true });
       io.to(room.id).emit("game:rematchStatus", null);
-      io.to(room.id).emit("game:state", roomStatePayload(room));
-      emitRoomList();
-
-      if (room.status === "playing") sendTurnMoves(room);
-      else scheduleBotIfWaiting(room);
+      emitStartNewGame(room, { forceBotIfSolo: false, swapColors: true });
       return;
     }
 
@@ -1559,15 +1563,17 @@ io.on("connection", async (socket) => {
       createdAt: Date.now()
     };
 
+    // requester redz, ka aizgāja piedāvājums
     socket.emit("game:rematchPending", { to: oppUsername });
 
-    // (opcionāli) status, ja tev UI to rāda
+    // status (ja kādam UI to rāda)
     io.to(room.id).emit("game:rematchStatus", { w: !!room.rematch.w, b: !!room.rematch.b });
 
-    io.to(oppSockId).emit("game:rematchPrompt", {
-      id: room.id,
-      from: u.username
-    });
+    // ✅ NEW: tiešais “offer ping” (tavam jaunajam game.js)
+    io.to(oppSockId).emit("game:rematchOffered", { id: room.id, from: u.username });
+
+    // ✅ LEGACY: vecā versija, ja kāds klausās game:rematchPrompt
+    io.to(oppSockId).emit("game:rematchPrompt", { id: room.id, from: u.username });
   }
 
   async function handleRematchAnswer({ id, accept } = {}) {
@@ -1591,11 +1597,9 @@ io.on("connection", async (socket) => {
       room.rematchPending = null;
       room.rematch = { w: false, b: false };
 
-      // abi atpakaļ uz menu (klients to realizē)
       io.to(room.id).emit("game:rematchDeclined", { by: u.username });
       io.to(room.id).emit("game:rematchStatus", null);
 
-      // drošībai: arī requester tieši (ja nav roomā kāda iemesla dēļ)
       if (requesterSock) io.to(requesterSock).emit("game:rematchDeclined", { by: u.username });
       return;
     }
@@ -1603,7 +1607,6 @@ io.on("connection", async (socket) => {
     // ACCEPT: start next game + swapColors
     room.rematchPending = null;
 
-    // atzīmējam otru pusi kā piekritušu (ja kāds UI to rāda)
     const myColor =
       room.white?.username === u.username ? "w" :
       room.black?.username === u.username ? "b" :
@@ -1614,28 +1617,22 @@ io.on("connection", async (socket) => {
 
     io.to(room.id).emit("game:rematchStatus", null);
 
-    resetRoomForNewGame(room, { forceBotIfSolo: false, swapColors: true });
-
-    io.to(room.id).emit("game:state", roomStatePayload(room));
-    emitRoomList();
-
-    if (room.status === "playing") sendTurnMoves(room);
-    else scheduleBotIfWaiting(room);
-  }
-
-  // helper drošai bot rematch reset darbībai (lai nav dublikātu)
-  function resetRoomFor_newSafe(room) {
-    resetRoomForNewGame(room, { forceBotIfSolo: false, swapColors: true });
-    io.to(room.id).emit("game:rematchStatus", null);
-    io.to(room.id).emit("game:state", roomStatePayload(room));
-    emitRoomList();
-    if (room.status === "playing") sendTurnMoves(room);
-    else scheduleBotIfWaiting(room);
+    emitStartNewGame(room, { forceBotIfSolo: false, swapColors: true });
   }
 
   // JAUNIE eventi
   socket.on("game:rematchRequest", handleRematchRequest);
   socket.on("game:rematchAnswer", handleRematchAnswer);
+
+  // ✅ Tavam game.js: NĒ poga sūta game:rematchDecline
+  socket.on("game:rematchDecline", ({ id } = {}) => {
+    handleRematchAnswer({ id, accept: false });
+  });
+
+  // (optional) ja kādreiz gribi explicit accept:
+  socket.on("game:rematchAccept", ({ id } = {}) => {
+    handleRematchAnswer({ id, accept: true });
+  });
 
   // VECĀS KLIETA versijas savietojamība (lai “nepazūd”)
   socket.on("game:rematch", handleRematchRequest);
@@ -1653,7 +1650,7 @@ io.on("connection", async (socket) => {
 
       room.spectators.delete(me);
 
-      // ja pending rematch iesaista šo useri -> notīram
+      // ja pending rematch iesaista šo useri -> notīram + paziņojam
       if (room.rematchPending && (room.rematchPending.from === me || room.rematchPending.to === me)) {
         room.rematchPending = null;
         room.rematch = { w: false, b: false };
