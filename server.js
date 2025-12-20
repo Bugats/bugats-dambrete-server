@@ -1,4 +1,4 @@
-un ielīmē iekš server.js const fs = require("fs");
+const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const express = require("express");
