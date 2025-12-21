@@ -19,6 +19,24 @@ const FORCE_MAX_CAPTURE = ["1", "true", "yes", "on"].includes(
   String(process.env.FORCE_MAX_CAPTURE || "").toLowerCase().trim()
 );
 
+// ✅ ANTI-UZVARU-FARMOŠANA (tikai ranked PvP)
+// Default: ieslēgts. Izslēgšana: ANTI_FARM_ENABLED=0 / false / off
+const ANTI_FARM_ENABLED = !["0", "false", "no", "off"].includes(
+  String(process.env.ANTI_FARM_ENABLED || "1").toLowerCase().trim()
+);
+
+// Minimālais “nopietnas spēles” slieksnis, lai skaitītu ranked atlīdzību
+const MIN_GAME_MOVES = parseInt(process.env.MIN_GAME_MOVES || "12", 10); // pliji (servera pieņemtie gājieni)
+const MIN_GAME_DURATION_MS = parseInt(process.env.MIN_GAME_DURATION_MS || "90000", 10); // 90s
+
+// Pāra (A vs B) rate-limit, lai nefarmotu ar vienu un to pašu pretinieku
+const PAIR_COOLDOWN_MS = parseInt(process.env.PAIR_COOLDOWN_MS || "120000", 10); // 2min
+const PAIR_WINDOW_MS = parseInt(process.env.PAIR_WINDOW_MS || "3600000", 10); // 1h
+const PAIR_MAX_MATCHES_PER_WINDOW = parseInt(
+  process.env.PAIR_MAX_MATCHES_PER_WINDOW || "8",
+  10
+);
+
 // thezone.lv + lokālie test URL
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   "https://thezone.lv,http://localhost:5500,http://127.0.0.1:5500")
@@ -257,6 +275,49 @@ io.use(async (socket, next) => {
     return next(new Error("UNAUTHORIZED"));
   }
 });
+
+// ---- Anti-farm helpers (runtime only) ----
+const pairHistory = new Map(); // pairKey -> { times: number[], last: number }
+function pairKey(a, b) {
+  const A = String(a || "").toLowerCase();
+  const B = String(b || "").toLowerCase();
+  return A < B ? `${A}|${B}` : `${B}|${A}`;
+}
+function prunePairRecord(rec, now) {
+  if (!rec) return;
+  const cutoff = now - PAIR_WINDOW_MS;
+  rec.times = (rec.times || []).filter((t) => t >= cutoff);
+  if (!rec.times.length) rec.last = 0;
+}
+function checkPairAntiFarm(a, b) {
+  const now = Date.now();
+  const key = pairKey(a, b);
+  const rec = pairHistory.get(key) || { times: [], last: 0 };
+
+  prunePairRecord(rec, now);
+
+  if (rec.last && now - rec.last < PAIR_COOLDOWN_MS) {
+    return { ok: false, reason: "PAIR_COOLDOWN" };
+  }
+  if (rec.times.length >= PAIR_MAX_MATCHES_PER_WINDOW) {
+    return { ok: false, reason: "PAIR_RATE_LIMIT" };
+  }
+  return { ok: true, reason: null };
+}
+function registerPairMatch(a, b) {
+  const now = Date.now();
+  const key = pairKey(a, b);
+  const rec = pairHistory.get(key) || { times: [], last: 0 };
+  prunePairRecord(rec, now);
+  rec.times.push(now);
+  rec.last = now;
+  pairHistory.set(key, rec);
+}
+
+function markGameStart(room) {
+  room.startedAt = Date.now();
+  room.moveCount = 0;
+}
 
 // ---- Game engine (Dambretes 8x8; ar krievu loģiku: sitiens obligāts; “max capture” pēc izvēles) ----
 // piece codes: 'w','b' men ; 'W','B' kings
@@ -764,6 +825,49 @@ async function updateStatsOnResult(winnerUsername, loserUsername) {
   io.emit("leaderboard:top10", computeTop10(users));
 }
 
+// ✅ Anti-farm gating (tikai ranked PvP atlīdzībām)
+async function maybeAwardRanked(room, winnerUsername, loserUsername, ctx = "WIN") {
+  try {
+    if (!winnerUsername || !loserUsername) return { awarded: false, reason: "MISSING" };
+    if (winnerUsername.startsWith("BOT_") || loserUsername.startsWith("BOT_")) {
+      return { awarded: false, reason: "BOT_GAME" };
+    }
+
+    ensureRanked(room);
+    if (!room?.ranked?.eligible) return { awarded: false, reason: "NOT_ELIGIBLE" };
+
+    if (!ANTI_FARM_ENABLED) {
+      await updateStatsOnResult(winnerUsername, loserUsername);
+      registerPairMatch(winnerUsername, loserUsername);
+      return { awarded: true, reason: null };
+    }
+
+    const now = Date.now();
+    const started = room.startedAt || now;
+    const dur = now - started;
+    const moves = room.moveCount || 0;
+
+    if (dur < MIN_GAME_DURATION_MS) {
+      return { awarded: false, reason: "TOO_FAST" };
+    }
+    if (moves < MIN_GAME_MOVES) {
+      return { awarded: false, reason: "TOO_FEW_MOVES" };
+    }
+
+    const pairOk = checkPairAntiFarm(winnerUsername, loserUsername);
+    if (!pairOk.ok) {
+      return { awarded: false, reason: pairOk.reason };
+    }
+
+    await updateStatsOnResult(winnerUsername, loserUsername);
+    registerPairMatch(winnerUsername, loserUsername);
+
+    return { awarded: true, reason: null };
+  } catch {
+    return { awarded: false, reason: "ERROR" };
+  }
+}
+
 function scheduleBotIfWaiting(room) {
   if (!room || room.status !== "waiting") return;
   if (room.botTimer) return;
@@ -802,6 +906,9 @@ function scheduleBotIfWaiting(room) {
     // REMATCH reset
     current.rematch = { w: false, b: false };
     current.rematchPending = null;
+
+    // ✅ start metrics
+    markGameStart(current);
 
     io.to(current.id).emit("game:state", roomStatePayload(current));
     emitRoomList();
@@ -873,7 +980,6 @@ function cancelForfeitIfReturning(room, username) {
 function startForfeitTimer(room, winner, loser) {
   ensureRanked(room);
   if (!room.ranked.eligible) return;
-  if (room.ranked.awarded) return;
   if (room.ranked.status === "pending") return;
 
   room.ranked.status = "pending";
@@ -895,13 +1001,19 @@ function startForfeitTimer(room, winner, loser) {
       return;
     }
 
-    room.ranked.status = "awarded";
-    room.ranked.awarded = true;
     room.ranked.timer = null;
 
-    await updateStatsOnResult(winner, loser);
+    // ✅ award with anti-farm
+    const award = await maybeAwardRanked(room, winner, loser, "DISCONNECT");
+    room.ranked.status = "awarded";
+    room.ranked.awarded = !!award.awarded;
+    room.ranked.reason = award.awarded ? "DISCONNECT" : `DISCONNECT_BLOCKED_${award.reason || "UNKNOWN"}`;
 
-    io.to(room.id).emit("ranked:forfeit", { winner, loser });
+    io.to(room.id).emit("ranked:forfeit", { winner, loser, awarded: !!award.awarded, blockedReason: award.awarded ? null : award.reason });
+    if (!award.awarded && award.reason && award.reason !== "NOT_ELIGIBLE") {
+      io.to(room.id).emit("ranked:blocked", { reason: award.reason, ctx: "DISCONNECT" });
+    }
+
     io.to(room.id).emit("game:state", roomStatePayload(room));
   }, FORFEIT_GRACE_MS);
 }
@@ -951,6 +1063,13 @@ function resetRoomForNewGame(room, { forceBotIfSolo = true, swapColors = true } 
     room.ranked.eligible = true;
   } else {
     room.ranked.eligible = false;
+  }
+
+  // ✅ start metrics only when playing
+  if (room.status === "playing") markGameStart(room);
+  else {
+    room.startedAt = null;
+    room.moveCount = 0;
   }
 }
 
@@ -1035,6 +1154,9 @@ function applyMoveCore(room, myColor, from, to, byUsername) {
   room.board[tr][tc] = newPiece;
 
   room.lastMove = { by: byUsername, from: [fr, fc], to: [tr, tc], capture: didCapture };
+
+  // ✅ move metrics (anti-farm)
+  room.moveCount = (room.moveCount || 0) + 1;
 
   if (didCapture) {
     if (!room.pending) {
@@ -1188,7 +1310,11 @@ io.on("connection", async (socket) => {
         ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
         rematch: { w: false, b: false },
         rematchPending: null,
-        vsBotAlt: false
+        vsBotAlt: false,
+
+        // ✅ anti-farm metrics
+        startedAt: null,
+        moveCount: 0
       };
 
       rooms.set(id, room);
@@ -1229,7 +1355,11 @@ io.on("connection", async (socket) => {
       ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
       rematch: { w: false, b: false },
       rematchPending: null,
-      vsBotAlt: false
+      vsBotAlt: false,
+
+      // ✅ anti-farm metrics
+      startedAt: null,
+      moveCount: 0
     };
 
     room.white = { username: u.username, avatarUrl: u.avatarUrl };
@@ -1244,6 +1374,12 @@ io.on("connection", async (socket) => {
       room.rematch = { w: false, b: false };
       room.rematchPending = null;
       room.vsBotAlt = false; // cilvēks šobrīd WHITE
+      ensureRanked(room);
+      room.ranked.eligible = false;
+
+      // ✅ start metrics
+      markGameStart(room);
+
       io.to(room.id).emit("game:state", roomStatePayload(room));
       emitRoomList();
       sendTurnMoves(room);
@@ -1287,7 +1423,11 @@ io.on("connection", async (socket) => {
         ranked: { eligible: false, status: "none", winner: null, loser: null, deadline: null, reason: null, timer: null, awarded: false },
         rematch: { w: false, b: false },
         rematchPending: null,
-        vsBotAlt: false
+        vsBotAlt: false,
+
+        // ✅ anti-farm metrics
+        startedAt: null,
+        moveCount: 0
       };
 
       rooms.set(id, room);
@@ -1331,6 +1471,8 @@ io.on("connection", async (socket) => {
       room.spectators.add(u.username);
     }
 
+    const wasWaiting = room.status === "waiting";
+
     if (room.white && room.black) {
       if (room.status === "waiting") {
         room.status = "playing";
@@ -1353,6 +1495,11 @@ io.on("connection", async (socket) => {
       room.pending = null;
       room.turnPlan = null;
       scheduleBotIfWaiting(room);
+    }
+
+    // ✅ start metrics only when transitioning waiting -> playing
+    if (wasWaiting && room.status === "playing") {
+      markGameStart(room);
     }
 
     io.to(id).emit("game:state", roomStatePayload(room));
@@ -1428,6 +1575,9 @@ io.on("connection", async (socket) => {
 
     room.status = "playing";
 
+    // ✅ start metrics
+    markGameStart(room);
+
     io.to(room.id).emit("game:state", roomStatePayload(room));
     emitRoomList();
     sendTurnMoves(room);
@@ -1459,7 +1609,13 @@ io.on("connection", async (socket) => {
     if (res.finished) {
       finishGame(room, res.winner, res.reason);
       const loser = myColor === "w" ? room.black?.username : room.white?.username;
-      if (res.winner && loser) await updateStatsOnResult(res.winner, loser);
+
+      if (res.winner && loser) {
+        const award = await maybeAwardRanked(room, res.winner, loser, "WIN");
+        if (!award.awarded && award.reason && award.reason !== "NOT_ELIGIBLE") {
+          io.to(room.id).emit("ranked:blocked", { reason: award.reason, ctx: "WIN" });
+        }
+      }
       return;
     }
 
@@ -1489,7 +1645,12 @@ io.on("connection", async (socket) => {
     finishGame(room, winner, "RESIGN");
 
     const loser = u.username;
-    if (winner && loser) await updateStatsOnResult(winner, loser);
+    if (winner && loser) {
+      const award = await maybeAwardRanked(room, winner, loser, "RESIGN");
+      if (!award.awarded && award.reason && award.reason !== "NOT_ELIGIBLE") {
+        io.to(room.id).emit("ranked:blocked", { reason: award.reason, ctx: "RESIGN" });
+      }
+    }
   });
 
   // ============================================================
@@ -1719,4 +1880,10 @@ server.listen(PORT, () => {
   console.log("BOT_JOIN_WAIT_MS:", BOT_JOIN_WAIT_MS);
   console.log("FORFEIT_GRACE_MS:", FORFEIT_GRACE_MS);
   console.log("FORCE_MAX_CAPTURE:", FORCE_MAX_CAPTURE);
+  console.log("ANTI_FARM_ENABLED:", ANTI_FARM_ENABLED);
+  console.log("MIN_GAME_MOVES:", MIN_GAME_MOVES);
+  console.log("MIN_GAME_DURATION_MS:", MIN_GAME_DURATION_MS);
+  console.log("PAIR_COOLDOWN_MS:", PAIR_COOLDOWN_MS);
+  console.log("PAIR_WINDOW_MS:", PAIR_WINDOW_MS);
+  console.log("PAIR_MAX_MATCHES_PER_WINDOW:", PAIR_MAX_MATCHES_PER_WINDOW);
 });
