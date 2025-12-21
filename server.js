@@ -125,6 +125,14 @@ app.use(
   })
 );
 
+// ✅ (drošs) CORS error handler, lai nedod HTML stacku
+app.use((err, req, res, next) => {
+  if (err && String(err.message || "").startsWith("CORS blocked:")) {
+    return res.status(403).json({ ok: false, error: err.message });
+  }
+  return next(err);
+});
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(PUBLIC_DIR));
 app.use("/uploads", express.static(UPLOADS_DIR));
@@ -1820,7 +1828,10 @@ io.on("connection", async (socket) => {
     // online lobby list update (pēc disconnect)
     emitOnlineList();
 
-    for (const room of rooms.values()) {
+    // ✅ FIX: droša dzēšana (neizlaiž roomus iterācijas laikā)
+    const toDelete = [];
+
+    for (const [rid, room] of rooms.entries()) {
       const wasWhite = room.white?.username === me;
       const wasBlack = room.black?.username === me;
       const wasInSeat = wasWhite || wasBlack;
@@ -1856,6 +1867,11 @@ io.on("connection", async (socket) => {
       } else {
         if (wasWhite) room.white = null;
         if (wasBlack) room.black = null;
+
+        // ✅ FIX: ja paliek 1 cilvēks un room ir waiting -> atkal startē BOT taimeri
+        if (room.status === "waiting") {
+          scheduleBotIfWaiting(room);
+        }
       }
 
       const hasHuman =
@@ -1866,9 +1882,11 @@ io.on("connection", async (socket) => {
       if (!hasHuman) {
         clearBotTimers(room);
         clearRankedTimer(room);
-        rooms.delete(room.id);
+        toDelete.push(rid);
       }
     }
+
+    for (const rid of toDelete) rooms.delete(rid);
 
     emitRoomList();
   });
